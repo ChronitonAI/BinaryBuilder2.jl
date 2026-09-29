@@ -4,7 +4,11 @@ export AuditInfo, AuditDependencyInfo
 struct AuditDependencyInfo
     # library products of the JLL, for the platform being audited
     libs::Vector{AbstractJLLProduct}
+    # Where its artifact is unpacked, when it is, so that its files can be inspected
+    artifact_dir::Union{Nothing,String}
 end
+AuditDependencyInfo(libs::Vector{<:AbstractJLLProduct}; artifact_dir::Union{Nothing,String} = nothing) =
+    AuditDependencyInfo(libs, artifact_dir)
 
 struct AuditLibraryInfo
     # The JLL's package name, e.g. `:Zlib_jll`

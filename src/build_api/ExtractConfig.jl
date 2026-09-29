@@ -204,13 +204,18 @@ end
     # Get libraries for all JLL dependencies
     get_library_products(jart::JLLBuildInfo) = filter((x)->isa(x, JLLLibraryProduct) || isa(x, JLLStaticLibraryProduct), jart.products)
     get_library_products(jll::JLLInfo, platform::AbstractPlatform) = get_library_products(select_platform(jll, platform))
+    # Each dependency's libraries, and where its artifact is unpacked (when it is),
+    # so that the static audit can verify an archive against its dependencies' real
+    # files rather than taking its declared edges on trust
     deps = Dict{Symbol,AuditDependencyInfo}()
     for dep in dep_jll_infos
-        deps[Symbol(dep.name, "_jll")] = AuditDependencyInfo(get_library_products(dep, platform))
+        deps[Symbol(dep.name, "_jll")] = AuditDependencyInfo(get_library_products(dep, platform);
+                                                     artifact_dir = dep_artifact_dir(meta, dep, platform))
     end
     # Get libraries for all inter-dependencies
     for (inter_dep_name, inter_dep) in config.inter_deps
-        deps[Symbol(inter_dep_name, "_jll")] = AuditDependencyInfo(inter_dep.audit_result.jll_lib_products)
+        deps[Symbol(inter_dep_name, "_jll")] = AuditDependencyInfo(inter_dep.audit_result.jll_lib_products;
+                                                           artifact_dir = artifact_path(inter_dep))
     end
     return audit!(
         artifact_dir,
@@ -221,6 +226,24 @@ end
         platform,
         kwargs...
     )
+end
+
+"""
+    dep_artifact_dir(meta, jll_info, platform)
+
+The directory a dependency JLL's artifact for `platform` is unpacked in within the
+universe's depot, or `nothing` if it has none there (its products may be bundled
+with Julia rather than bound to an artifact, or the artifact may not be present).
+"""
+function dep_artifact_dir(meta, jll_info::JLLInfo, platform::AbstractPlatform)
+    build = try
+        select_platform(jll_info, platform)
+    catch
+        return nothing
+    end
+    isa(build.artifact, JLLArtifactBinding) || return nothing
+    dir = artifact_path(meta.universe, build.artifact.treehash)
+    return isdir(dir) ? dir : nothing
 end
 
 function find_unlocatable_products(config::ExtractConfig, prefix)
