@@ -329,6 +329,7 @@ function prepare(jlls::Vector{JLLSource};
                         jll.package.repo = pkg.repo
                     end
                     append!(jll.artifact_paths, art_paths[pkg])
+                    check_rr_softticks_artifacts(jll, platform)
                     @debug("Prepared", jll, pkg, cache_path, prefix, platform)
                 end
 
@@ -361,6 +362,41 @@ function prepare(jlls::Vector{JLLSource};
                         TOML.print(io, cache_entry)
                     end
                 end
+            end
+        end
+    end
+end
+
+"""
+    check_rr_softticks_artifacts(jll::JLLSource, platform)
+
+On an rr software ticks platform (an `rr_softticks` tag), a dependency must provide an
+artifact built for that platform: one without the tag matches too (platform matching
+ignores tags that only one side has), but its code is not instrumented. JLLs that a
+toolchain pins to a repository and installs into a subdirectory (its sysroot) are the
+toolchain's business and are not checked.
+"""
+function check_rr_softticks_artifacts(jll::JLLSource, platform::AbstractPlatform)
+    abi = get(tags(platform), "rr_softticks", nothing)
+    if abi === nothing || !isempty(jll.target) || jll.package.repo.source !== nothing
+        return
+    end
+    pkg_dir = jll.package.path
+    if pkg_dir === nothing && jll.package.tree_hash !== nothing
+        pkg_dir = Pkg.Operations.find_installed(jll.package.name, jll.package.uuid, jll.package.tree_hash)
+    end
+    artifacts_toml = pkg_dir === nothing ? "" : joinpath(pkg_dir, "Artifacts.toml")
+    isfile(artifacts_toml) || return
+    selected = Set(basename.(jll.artifact_paths))
+    for (_, entries) in TOML.parsefile(artifacts_toml)
+        for entry in (entries isa AbstractVector ? entries : [entries])
+            entry isa AbstractDict || continue
+            get(entry, "git-tree-sha1", "") in selected || continue
+            # Platform-independent artifacts (no `arch`) hold no code.
+            haskey(entry, "arch") || continue
+            if get(entry, "rr_softticks", nothing) != abi
+                error("$(jll.package.name) has no artifact built for rr_softticks=$(abi) ",
+                      "(selected: $(get(entry, "git-tree-sha1", "?"))); build it for this platform first")
             end
         end
     end
