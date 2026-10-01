@@ -790,7 +790,16 @@ function register_jll!(u::Universe, jll::JLLInfo; skip_artifact_export::Bool = f
 
     in_universe(u) do env
         # Next, add that JLL to the universe's environment
-        Pkg.develop(;path=jll_path, io=verbose ? stdout : devnull)
+        # JLLs that are also in the sysimage (CompilerSupportLibraries_jll, Zlib_jll, ...)
+        # can only be developed with this check off; the universe's environment is never
+        # loaded into this process, so the sysimage's copies don't matter here.
+        respect = Pkg.RESPECT_SYSIMAGE_VERSIONS[]
+        Pkg.respect_sysimage_versions(false)
+        try
+            Pkg.develop(;path=jll_path, io=verbose ? stdout : devnull)
+        finally
+            Pkg.respect_sysimage_versions(respect)
+        end
     end
 
     # Finally, register it into the universe's local BB2 registry

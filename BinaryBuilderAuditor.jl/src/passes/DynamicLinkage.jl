@@ -161,7 +161,15 @@ function rpaths_consistent!(scan::ScanResult,
     # present in the RPATHs of that binary object
     for (rel_path, oh) in scan.binary_objects
         dep_relpaths = Set{String}()
-        if !isdynamic(oh)
+        # ObjectFile cannot read every ELF file a build installs (seen with binutils'
+        # outputs); report it rather than failing the whole audit.
+        dynamic = try
+            isdynamic(oh)
+        catch e
+            push_result!(pass_results, "rpaths_consistent!", :warn, rel_path, "Unable to read the object: $(sprint(showerror, e))")
+            continue
+        end
+        if !dynamic
             continue
         end
         for soname in [basename(path(dl)) for dl in DynamicLinks(oh)]
