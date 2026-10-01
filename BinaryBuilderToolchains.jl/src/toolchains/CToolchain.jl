@@ -122,8 +122,10 @@ struct CToolchain <: AbstractToolchain
             cxx_runtime,
         )
 
-        # Concretize the JLLSource's `PackageSpec`'s version (and UUID) now:
-        resolve_versions!(deps; julia_version=nothing)
+        # Concretize the JLLSource's `PackageSpec`'s version (and UUID) now. Not the
+        # software ticks plugin: it is resolved with the build's other dependencies, in
+        # the build's universe, where it may have been built.
+        resolve_versions!(filter(d -> d.package.name != "GCCSoftTicksPlugin_jll", deps); julia_version=nothing)
 
         gcc_version = nothing
         for name in ("GCC", "GCCBootstrap")
@@ -557,7 +559,22 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
             gcc_support_libs...,
             libstdcxx_libs...,
         ])
+        # Software ticks platforms compile everything with the software ticks plugin,
+        # built against this GCC (a GCC plugin only loads into the GCC release it was
+        # built for). It runs inside the compiler, so it is for the host.
+        if rr_softticks(platform.target) !== nothing
+            push!(deps, JLLSource(
+                "GCCSoftTicksPlugin_jll",
+                platform.host;
+                uuid=Base.UUID("6218a57a-bfcc-5647-9929-e3a5dd6f2900"),
+                version=v"14.2.0",
+                target="softticks",
+            ))
+        end
     elseif vendor == :clang || vendor == :clang_bootstrap
+        if rr_softticks(platform.target) !== nothing
+            throw(ArgumentError("Software ticks platforms ($(triplet(platform.target))) need the GCC vendor for now"))
+        end
         if vendor == :clang
             append!(deps, [
                 clang_jlls...,
@@ -782,6 +799,25 @@ function add_user_flags(io, toolchain)
 end
 
 """
+    add_softticks_flags(io, toolchain)
+
+On a software ticks platform (see `rr_softticks()`), load the software ticks plugin
+into every compilation, so that the code counts its own ticks. Setting
+`BB_SOFTTICKS_DISABLE` in the environment builds without it, for code that must not
+be instrumented (a tracer that runs on the platform, say).
+"""
+function add_softticks_flags(io, toolchain)
+    if rr_softticks(toolchain.platform.target) === nothing
+        return
+    end
+    compile_flagmatch(io) do io
+        println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
+        append_flags(io, :PRE, ["-fplugin=\$(dirname \"\${WRAPPER_DIR}\")/softticks/lib/softticks_gcc.so"])
+        println(io, "fi")
+    end
+end
+
+"""
     add_macos_flags(io, toolchain)
 
 This adds flags like `-mmacosx-version-min`, depending on our `os_version`
@@ -843,6 +879,7 @@ function gcc_wrappers(toolchain::CToolchain, dir::String)
         add_microarchitectural_flags(io, toolchain)
         add_cxxabi_flags(io, toolchain)
         add_user_flags(io, toolchain)
+        add_softticks_flags(io, toolchain)
         add_macos_flags(io, toolchain)
 
         compile_flagmatch(io) do io

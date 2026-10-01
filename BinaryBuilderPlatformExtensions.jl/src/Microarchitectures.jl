@@ -1,6 +1,6 @@
 using OrderedCollections
 
-export get_march_flags, get_all_arch_names, get_all_march_names, march, sanitize
+export get_march_flags, get_all_arch_names, get_all_march_names, march, sanitize, rr_softticks
 
 # Recursively test for key presence in nested dicts
 function haskeys(d, keys...)
@@ -107,3 +107,14 @@ const ARCHITECTURE_FLAGS = Dict(
 )
 march(p::AbstractPlatform; default=nothing) = get(tags(p), "march", default)
 sanitize(p::AbstractPlatform; default=nothing) = get(tags(p), "sanitize", default)
+
+"""
+    rr_softticks(p::AbstractPlatform; default=nothing)
+
+The rr software ticks ABI version that code for `p` is built for (the `rr_softticks`
+tag, e.g. `x86_64-linux-gnu-rr_softticks+1`), or `default` if `p` is not a software
+ticks platform. Code for such a platform counts its own ticks (rr's `TICKS_SOFTWARE`):
+the C toolchain loads the software ticks compiler plugin into every compilation, so
+the binaries carry the `.note.rrsoftticks` note and rr records them without a PMU.
+"""
+rr_softticks(p::AbstractPlatform; default=nothing) = get(tags(p), "rr_softticks", default)
