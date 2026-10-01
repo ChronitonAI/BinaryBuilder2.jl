@@ -311,7 +311,21 @@ end
 
 # It would be nice if `Pkg.Registry` just exported something like this
 function Pkg.Registry.parsefile(reg_inst::RegistryInstance, path::String)
-    return Pkg.Registry.parsefile(reg_inst.in_memory_registry, reg_inst.path, path)
+    reg_inst.pkgs # load the registry, if it is not loaded yet
+    in_memory = getfield(reg_inst, :in_memory_registry)
+    try
+        return Pkg.Registry.parsefile(in_memory, reg_inst.path, path)
+    catch e
+        # Pkg caches compressed registries in memory, and after `update_registries!()`
+        # replaced the tarball, a cached instance can hold the previous tarball's files
+        # (seen with Pkg 1.13). Read the current tarball and try again.
+        (isa(e, KeyError) && in_memory !== nothing) || rethrow()
+        tarball = joinpath(dirname(reg_inst.path), getfield(reg_inst, :compressed_file))
+        fresh = Pkg.Registry.uncompress_registry(tarball)
+        haskey(fresh, Pkg.Registry.to_tar_path_format(path)) || throw(SystemError(path, 2))
+        setfield!(reg_inst, :in_memory_registry, fresh)
+        return Pkg.Registry.parsefile(fresh, reg_inst.path, path)
+    end
 end
 
 function registry_package_lookup(f::Function, u::Universe, pkg_name::String, pkg_file::String; registries = u.registry_instances)
