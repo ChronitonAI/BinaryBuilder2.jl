@@ -177,6 +177,32 @@ ENV["TESTSUITE_OUTPUT_DIR"] = mktempdir(;cleanup=false)
         end
     end
 
+    # Software ticks platforms load the plugin for their compiler (the plugin JLLs are
+    # only built in ygglet's universe, so this checks the selection and the wrappers).
+    @testset "rr_softticks" begin
+        st_platform = CrossPlatform(BBHostPlatform() => Platform("x86_64", "linux"; rr_softticks="1"))
+        for (vendor, plugin_jll, wrapper, flag) in (
+                (:gcc, "GCCSoftTicksPlugin_jll", "gcc", "-fplugin="),
+                (:clang, "LLVMSoftTicksPlugin_jll", "clang", "-fpass-plugin="))
+            toolchain = CToolchain(st_platform; vendor)
+            @test count(jll -> jll.package.name ∈ BinaryBuilderToolchains.softticks_plugin_jlls, toolchain.deps) == 1
+            @test any(jll -> jll.package.name == plugin_jll, toolchain.deps)
+            mktempdir() do dir
+                if vendor == :gcc
+                    BinaryBuilderToolchains.gcc_wrappers(toolchain, dir)
+                else
+                    BinaryBuilderToolchains.clang_wrappers(toolchain, dir)
+                end
+                script = read(joinpath(dir, "x86_64-linux-gnu-$(wrapper)"), String)
+                @test occursin(flag, script)
+                @test occursin("-D__RR_SOFTTICKS__=1", script)
+                @test occursin("BB_SOFTTICKS_DISABLE", script)
+                @test occursin("--load-pass-plugin=", script) == (vendor == :clang)
+            end
+        end
+        @test_throws ArgumentError CToolchain(st_platform; vendor=:clang_bootstrap)
+    end
+
     # Ensure that `strip` works for macOS without needing to resign
     @testset "macos strip resigning" begin
         for macos_target in filter(Sys.isapple, supported_platforms(CToolchain))

@@ -2,6 +2,9 @@ export CToolchain
 using Pkg, SHA
 using Pkg.Types: PackageSpec, VersionSpec
 
+# The software ticks plugins (`add_softticks_flags()`), one per compiler.
+const softticks_plugin_jlls = ("GCCSoftTicksPlugin_jll", "LLVMSoftTicksPlugin_jll")
+
 struct CToolchain <: AbstractToolchain
     platform::CrossPlatform
 
@@ -123,9 +126,9 @@ struct CToolchain <: AbstractToolchain
         )
 
         # Concretize the JLLSource's `PackageSpec`'s version (and UUID) now. Not the
-        # software ticks plugin: it is resolved with the build's other dependencies, in
-        # the build's universe, where it may have been built.
-        resolve_versions!(filter(d -> d.package.name != "GCCSoftTicksPlugin_jll", deps); julia_version=nothing)
+        # software ticks plugins: they are resolved with the build's other dependencies,
+        # in the build's universe, where they may have been built.
+        resolve_versions!(filter(d -> d.package.name ∉ softticks_plugin_jlls, deps); julia_version=nothing)
 
         gcc_version = nothing
         for name in ("GCC", "GCCBootstrap")
@@ -160,7 +163,7 @@ struct CToolchain <: AbstractToolchain
             extra_ldflags...,
             # The software ticks flags the wrappers add (`add_softticks_flags()`): bump the
             # version when they change, so that cached wrappers are regenerated.
-            rr_softticks(platform.target) === nothing ? "" : "softticks-wrappers-2",
+            rr_softticks(platform.target) === nothing ? "" : "softticks-wrappers-3",
         )
         cache_key = string(
             "CToolchain-",
@@ -575,14 +578,27 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
             ))
         end
     elseif vendor == :clang || vendor == :clang_bootstrap
-        if rr_softticks(platform.target) !== nothing
-            throw(ArgumentError("Software ticks platforms ($(triplet(platform.target))) need the GCC vendor for now"))
-        end
         if vendor == :clang
             append!(deps, [
                 clang_jlls...,
             ])
+            # Software ticks platforms compile everything with the software ticks pass
+            # plugin, built against this clang's LLVM (a pass plugin takes LLVM's symbols
+            # from the clang that loads it, so it only loads into the LLVM major version it
+            # was built for). It runs inside the compiler, so it is for the host.
+            if rr_softticks(platform.target) !== nothing
+                push!(deps, JLLSource(
+                    "LLVMSoftTicksPlugin_jll",
+                    platform.host;
+                    uuid=Base.UUID("7f0adc07-ecf3-5941-9330-abc1b1dd7590"),
+                    version=v"17.0.0",
+                    target="softticks",
+                ))
+            end
         else
+            if rr_softticks(platform.target) !== nothing
+                throw(ArgumentError("Software ticks platforms ($(triplet(platform.target))) need the GCC or clang vendor, not $(vendor)"))
+            end
             append!(deps, [
                 clang_bootstrap_jlls...,
             ])
@@ -802,29 +818,54 @@ function add_user_flags(io, toolchain)
 end
 
 """
-    add_softticks_flags(io, toolchain)
+    add_softticks_flags(io, toolchain, compiler::Symbol)
 
 On a software ticks platform (see `rr_softticks()`), load the software ticks plugin
 into every compilation, so that the code counts its own ticks, and predefine
 `__RR_SOFTTICKS__` (the ABI version) so that code the plugin cannot instrument (loops in
-inline or hand-written assembly) can tick by hand (`rr_softticks.h`). The GCC plugin
-defines the macro itself too; an LLVM pass plugin runs after preprocessing and cannot, so
-the wrapper defines it for every vendor. Setting `BB_SOFTTICKS_DISABLE` in the environment
-builds without either, for code that must not be instrumented (a tracer that runs on the
-platform, say).
+inline or hand-written assembly) can tick by hand (`rr_softticks.h`). `compiler` is the
+wrapped compiler: `:gcc` loads the GCC plugin (`GCCSoftTicksPlugin_jll`, `-fplugin=`),
+`:clang` the LLVM pass plugin (`LLVMSoftTicksPlugin_jll`, `-fpass-plugin=`). The GCC
+plugin defines the macro itself too; an LLVM pass plugin runs after preprocessing and
+cannot, so the wrapper defines it for both. Setting `BB_SOFTTICKS_DISABLE` in the
+environment builds without either, for code that must not be instrumented (a tracer that
+runs on the platform, say).
+
+LTO with clang: the pre-link compiles are not instrumented, the LTO backend in the linker
+must load the pass plugin too, and the clang driver does not pass it on. Of our linkers
+only lld can (there is no LLVMgold), so a clang link with `-fuse-ld=lld` also gets
+`-Wl,--load-pass-plugin=` (harmless for a link without bitcode). An LTO link with any other
+linker fails anyway.
 """
-function add_softticks_flags(io, toolchain)
+function add_softticks_flags(io, toolchain, compiler::Symbol)
     abi = rr_softticks(toolchain.platform.target)
     if abi === nothing
         return
     end
+    softticks_lib = "\$(dirname \"\${WRAPPER_DIR}\")/softticks/lib"
+    if compiler == :gcc
+        plugin_flag = "-fplugin=$(softticks_lib)/softticks_gcc.so"
+    elseif compiler == :clang
+        plugin_flag = "-fpass-plugin=$(softticks_lib)/softticks_llvm.so"
+    else
+        throw(ArgumentError("No software ticks plugin for compiler '$(compiler)'"))
+    end
     compile_flagmatch(io) do io
         println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
         append_flags(io, :PRE, [
-            "-fplugin=\$(dirname \"\${WRAPPER_DIR}\")/softticks/lib/softticks_gcc.so",
+            plugin_flag,
             "-D__RR_SOFTTICKS__=$(abi)",
         ])
         println(io, "fi")
+    end
+    if compiler == :clang
+        link_flagmatch(io) do io
+            flagmatch(io, [flag"-fuse-ld=lld"]) do io
+                println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
+                append_flags(io, :PRE, "-Wl,--load-pass-plugin=$(softticks_lib)/softticks_llvm.so")
+                println(io, "fi")
+            end
+        end
     end
 end
 
@@ -890,7 +931,7 @@ function gcc_wrappers(toolchain::CToolchain, dir::String)
         add_microarchitectural_flags(io, toolchain)
         add_cxxabi_flags(io, toolchain)
         add_user_flags(io, toolchain)
-        add_softticks_flags(io, toolchain)
+        add_softticks_flags(io, toolchain, :gcc)
         add_macos_flags(io, toolchain)
 
         compile_flagmatch(io) do io
@@ -1033,6 +1074,7 @@ function clang_wrappers(toolchain::CToolchain, dir::String)
         add_microarchitectural_flags(io, toolchain)
         add_cxxabi_flags(io, toolchain)
         add_user_flags(io, toolchain)
+        add_softticks_flags(io, toolchain, :clang)
         add_macos_flags(io, toolchain)
 
         # If `ccache` is allowed, sneak `ccache` in as the first argument to `PROG`
