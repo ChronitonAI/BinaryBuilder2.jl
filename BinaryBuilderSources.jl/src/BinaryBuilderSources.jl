@@ -72,12 +72,13 @@ function prepare(sources::Vector{<:AbstractSource};
                  depot::String = default_jll_source_depot(),
                  registries::Vector{Pkg.Registry.RegistryInstance} = Pkg.Registry.reachable_registries(; depots=[depot]),
                  project_dir::String = mktempdir(),
+                 fallback_depot::String = depot,
                  to::TimerOutput = TimerOutput())
     # Special-case JLL sources, as we get a material benefit when batching those:
     jlls = JLLSource[s for s in sources if isa(s, JLLSource)]
     non_jlls = [s for s in sources if !isa(s, JLLSource)]
     if !isempty(jlls)
-        prepare(jlls; verbose, project_dir, depot, registries, force, to)
+        prepare(jlls; verbose, project_dir, depot, fallback_depot, registries, force, to)
     end
     prepare.(non_jlls; verbose)
     return nothing

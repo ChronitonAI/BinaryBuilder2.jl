@@ -290,6 +290,51 @@ function in_universe(f::Function, u::Universe;
 end
 
 depot_path(u::Universe) = u.depot_path
+
+"""
+    upstream_depot_path(u::Universe)
+
+A depot that shares everything with the universe's depot except for its local registry
+(`BB2LocalRegistry`): it sees only the upstream registries (e.g. `General`).  JLLs built in
+a universe are developed into its environment and registered into its local registry at
+versions above the upstream ones; for a platform that none of their artifacts strictly
+matches (see `BinaryBuilderSources.strict_tags`), `prepare()` resolves them in this depot
+instead, so that they (and their dependencies) come from the upstream registries.
+"""
+function upstream_depot_path(u::Universe)
+    upstream_depot = joinpath(u.depot_path, "upstream_depot")
+    mkpath(upstream_depot)
+    # Share the stores (and the registry update log in `scratchspaces`, which keeps `Pkg`
+    # from updating the registries underneath us) with the universe's depot.
+    for store_name in ("artifacts", "packages", "compiled", "logs", "clones", "scratchspaces")
+        store_path = joinpath(upstream_depot, store_name)
+        if !islink(store_path)
+            mkpath(joinpath(u.depot_path, store_name))
+            rm(store_path; recursive=true, force=true)
+            symlink(joinpath(u.depot_path, store_name), store_path; dir_target=true)
+        end
+    end
+    # Mirror the universe's registries, leaving out the local one.
+    registries_dir = joinpath(upstream_depot, "registries")
+    mkpath(registries_dir)
+    local_registry_name = first(u.registries).name
+    universe_registries = filter(readdir(joinpath(u.depot_path, "registries"))) do name
+        return name != local_registry_name
+    end
+    for name in readdir(registries_dir)
+        if name ∉ universe_registries
+            rm(joinpath(registries_dir, name); recursive=true, force=true)
+        end
+    end
+    for name in universe_registries
+        link_path = joinpath(registries_dir, name)
+        if !islink(link_path)
+            rm(link_path; recursive=true, force=true)
+            symlink(joinpath(u.depot_path, "registries", name), link_path)
+        end
+    end
+    return upstream_depot
+end
 function environment_path(u::Universe)
     env_path = joinpath(u.depot_path, "environments", "binarybuilder")
     mkpath(env_path)

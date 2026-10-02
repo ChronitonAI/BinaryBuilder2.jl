@@ -332,6 +332,7 @@ metadir_prefix() = "/workspace/metadir"
                     project_dir,
                     registries,
                     depot,
+                    fallback_depot=upstream_depot_path(universe),
                     to=config.to,
                 )
             end

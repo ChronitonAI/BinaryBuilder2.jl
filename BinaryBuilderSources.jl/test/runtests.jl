@@ -2,6 +2,8 @@ using Test, BinaryBuilderSources, SHA, Base.BinaryPlatforms, Pkg, TreeArchival
 using BinaryBuilderSources: verify, download_cache_path, source_download_cache, generated_source_cache
 using BinaryBuilderSources: registry_slice_hash, full_registries_hash
 using BinaryBuilderSources: strict_tags, check_strict_tags, exempt_from_strict_tags
+using BinaryBuilderSources: has_strictly_matching_artifact, developed_jlls_without_strict_match
+using JLLPrefixes, TOML
 using Pkg.Registry: RegistryInstance
 
 include("common.jl")
@@ -421,6 +423,76 @@ const binlib = Sys.iswindows() ? "bin" : "lib"
                 @test !isempty(zlib_msan.artifact_paths)
                 @test !isempty(zlib_plain.artifact_paths)
                 @test zlib_msan.artifact_paths != zlib_plain.artifact_paths
+
+                @testset "developed JLLs fall back to the registries" begin
+                    # What counts as a strict match
+                    mktempdir() do dir
+                        toml = joinpath(dir, "Artifacts.toml")
+                        entry(; kwargs...) = Dict{String,Any}("git-tree-sha1" => "0"^40, "arch" => "x86_64", "os" => "linux", "libc" => "glibc",
+                                                              (string(k) => v for (k, v) in kwargs)...)
+                        write_toml(d) = open(io -> TOML.print(io, d), toml; write=true)
+                        write_toml(Dict("Foo" => [entry(; sanitize="memory")]))
+                        @test has_strictly_matching_artifact(toml, "Foo", msan)
+                        @test !has_strictly_matching_artifact(toml, "Foo", plain)
+                        write_toml(Dict("Foo" => [entry(; sanitize="memory"), entry()]))
+                        @test has_strictly_matching_artifact(toml, "Foo", msan)
+                        @test has_strictly_matching_artifact(toml, "Foo", plain)
+                        # Matching as usual, too
+                        @test !has_strictly_matching_artifact(toml, "Foo", Platform("aarch64", "linux"))
+                        # Platform-independent artifacts, JLLs without the artifact or without
+                        # an Artifacts.toml: nothing to disagree with
+                        write_toml(Dict("Foo" => Dict("git-tree-sha1" => "0"^40)))
+                        @test has_strictly_matching_artifact(toml, "Foo", msan)
+                        write_toml(Dict("Bar" => [entry(; sanitize="memory")]))
+                        @test has_strictly_matching_artifact(toml, "Foo", plain)
+                        @test has_strictly_matching_artifact(joinpath(dir, "nope.toml"), "Foo", plain)
+                    end
+
+                    # An environment that develops a `Zlib_jll` built only for `msan` (like
+                    # a `Universe` that built it for that platform): General's `Zlib_jll`
+                    # with only its `sanitize=memory` artifacts.
+                    depot = BinaryBuilderSources.default_jll_source_depot()
+                    zlib_dir = mktempdir()
+                    zlib_src = Pkg.Operations.find_installed("Zlib_jll", zlib_plain.package.uuid, zlib_plain.package.tree_hash)
+                    cp(zlib_src, zlib_dir; force=true)
+                    chmod(zlib_dir, 0o755; recursive=true)
+                    artifacts = TOML.parsefile(joinpath(zlib_dir, "Artifacts.toml"))
+                    filter!(e -> get(e, "sanitize", nothing) == "memory", artifacts["Zlib"])
+                    @test !isempty(artifacts["Zlib"])
+                    open(io -> TOML.print(io, artifacts), joinpath(zlib_dir, "Artifacts.toml"); write=true)
+                    project_dir = mktempdir()
+                    JLLPrefixes.with_no_pkg_handrails() do
+                        JLLPrefixes.with_depot_path(depot) do
+                            Pkg.activate(project_dir) do
+                                Pkg.develop(; path=zlib_dir, io=devnull)
+                            end
+                        end
+                    end
+                    zlib_uuid = zlib_plain.package.uuid
+                    @test developed_jlls_without_strict_match(project_dir, plain) == Dict(zlib_uuid => "Zlib_jll")
+                    @test isempty(developed_jlls_without_strict_match(project_dir, msan))
+
+                    # For `msan`, the developed JLL is used
+                    dev_msan = JLLSource("Zlib_jll", msan)
+                    prepare([dev_msan]; project_dir, depot, force=true)
+                    @test dev_msan.package.path == zlib_dir
+                    @test basename.(dev_msan.artifact_paths) == basename.(zlib_msan.artifact_paths)
+
+                    # For `plain` it has no strictly matching artifact: the registered one is used
+                    dev_plain = JLLSource("Zlib_jll", plain)
+                    prepare([dev_plain]; project_dir, depot, force=true)
+                    @test dev_plain.package.path === nothing
+                    @test basename.(dev_plain.artifact_paths) == basename.(zlib_plain.artifact_paths)
+
+                    # Also as a dependency of something else
+                    libpng_plain = JLLSource("libpng_jll", plain)
+                    prepare([libpng_plain]; project_dir, depot, force=true)
+                    @test basename(zlib_plain.artifact_paths[1]) in basename.(libpng_plain.artifact_paths)
+                    @test basename(zlib_msan.artifact_paths[1]) ∉ basename.(libpng_plain.artifact_paths)
+
+                    # The environment itself is left alone
+                    @test developed_jlls_without_strict_match(project_dir, plain) == Dict(zlib_uuid => "Zlib_jll")
+                end
             end
 
             # retarget works

@@ -185,7 +185,8 @@ function prepare(jlls::Vector{JLLSource};
                  force::Bool = false,
                  registries::Vector{Pkg.Registry.RegistryInstance} = Pkg.Registry.reachable_registries(; depots=[depot]),
                  to::TimerOutput = TimerOutput(),
-                 ignore_empty_registries::Bool = false)
+                 ignore_empty_registries::Bool = false,
+                 fallback_depot::String = depot)
     # Split JLLs by platform:
     jlls_by_platform_by_prefix = Dict{AbstractPlatform,Dict{String,Vector{JLLSource}}}()
 
@@ -237,6 +238,10 @@ function prepare(jlls::Vector{JLLSource};
             push!(built_uuids, Base.UUID(uuid))
         end
     end
+
+    # Projects to resolve slices in for which some of `project_dir`'s developed JLLs have
+    # no strictly matching artifact, by the set of such JLLs (see `strict_fallback_project()`).
+    fallback_projects = Dict{Set{Base.UUID},String}()
 
     # For each group of platforms and sharded by prefix, we are able to download as a group:
     # We can't do it all together because it's totally valid for us to try and download
@@ -328,7 +333,27 @@ function prepare(jlls::Vector{JLLSource};
             if any(isempty(jll.artifact_paths) for jll in jlls_slice)
                 @timeit to "collect_artifact_metas" begin
                     slice_deps = [jll.package for jll in jlls_slice]
-                    artifact_metas = collect_artifact_metas(slice_deps; platform, project_dir, pkg_depot=depot, verbose)
+                    # JLLs developed in `project_dir` (e.g. built in a `Universe`) are used
+                    # only for platforms that one of their artifacts strictly matches
+                    # (see `strict_tags`); for other platforms, resolve from the registries.
+                    slice_project_dir, slice_depot = project_dir, depot
+                    fallback = developed_jlls_without_strict_match(project_dir, platform)
+                    if !isempty(fallback)
+                        @debug("Resolving developed JLLs from the registries", platform, prefix, fallback=sort(collect(values(fallback))))
+                        slice_project_dir = get!(fallback_projects, Set(keys(fallback))) do
+                            strict_fallback_project(project_dir, fallback; depot=fallback_depot, platform, verbose)
+                        end
+                        slice_depot = fallback_depot
+                    end
+                    artifact_metas = try
+                        collect_artifact_metas(slice_deps; platform, project_dir=slice_project_dir, pkg_depot=slice_depot, verbose)
+                    catch
+                        fallen_back = [jll.package.name for jll in jlls_slice if haskey(fallback, jll.package.uuid)]
+                        if !isempty(fallen_back)
+                            @error("Unable to resolve JLLs from the registries for $(triplet(platform)): the versions developed in $(project_dir) have no artifact for it (see `BinaryBuilderSources.strict_tags`)", jlls=fallen_back)
+                        end
+                        rethrow()
+                    end
                     art_paths = collect_artifact_paths(artifact_metas, slice_deps)
                 end
                 if !all(exempt_from_strict_tags, jlls_slice)
@@ -444,6 +469,101 @@ function check_strict_tags(artifact_metas::Dict, platform::AbstractPlatform)
             end
         end
     end
+end
+
+"""
+    has_strictly_matching_artifact(artifacts_toml::String, name::String, platform::AbstractPlatform)
+
+Whether the `Artifacts.toml` file of a JLL has an artifact named `name` that can be used
+for `platform`: one that matches it, and agrees with it on every tag in `strict_tags`
+(including the tag being absent on both sides).  A platform-independent artifact, or a JLL
+without such an artifact at all, counts as a match: there is nothing that could disagree.
+"""
+function has_strictly_matching_artifact(artifacts_toml::String, name::String, platform::AbstractPlatform)
+    isfile(artifacts_toml) || return true
+    entries = get(TOML.parsefile(artifacts_toml), name, nothing)
+    if !isa(entries, AbstractVector)
+        # No such artifact, or a single platform-independent one
+        return true
+    end
+    platform_tags = tags(platform)
+    for entry in entries
+        if !haskey(entry, "arch")
+            return true
+        end
+        artifact_platform = Pkg.Artifacts.unpack_platform(entry, name, artifacts_toml)
+        if artifact_platform !== nothing && platforms_match(artifact_platform, platform) &&
+           all(get(platform_tags, tag, nothing) == get(entry, tag, nothing) for tag in strict_tags)
+            return true
+        end
+    end
+    return false
+end
+
+"""
+    developed_jlls_without_strict_match(project_dir::String, platform::AbstractPlatform)
+
+Return the JLLs (as a `Dict` from UUID to name) that the manifest of the environment in
+`project_dir` has developed by path (as a `Universe` does with the JLLs it builds) but that
+have no artifact strictly matching `platform` (see `has_strictly_matching_artifact()`).
+"""
+function developed_jlls_without_strict_match(project_dir::String, platform::AbstractPlatform)
+    no_match = Dict{Base.UUID,String}()
+    manifest_path = Pkg.Types.manifestfile_path(project_dir; strict=true)
+    if manifest_path === nothing
+        return no_match
+    end
+    for (uuid, entry) in Pkg.Types.read_manifest(manifest_path)
+        if entry.path === nothing || !endswith(entry.name, "_jll")
+            continue
+        end
+        pkg_dir = normpath(joinpath(dirname(manifest_path), entry.path))
+        artifact_name = entry.name[1:end-4]
+        if !has_strictly_matching_artifact(joinpath(pkg_dir, "Artifacts.toml"), artifact_name, platform)
+            no_match[uuid] = entry.name
+        end
+    end
+    return no_match
+end
+
+"""
+    strict_fallback_project(project_dir::String, fallback::Dict{Base.UUID,String};
+                            depot::String, platform::AbstractPlatform, verbose::Bool = false)
+
+Create (in a new temporary directory, which is returned) a copy of the environment in
+`project_dir` without the developed JLLs in `fallback` (UUID to name), resolved in `depot`.
+Those JLLs, if anything still needs them, and their dependencies are then resolved from the
+registries of `depot` like any other package; this needs a `depot` without a registry that
+lists the developed versions (such as a `Universe`'s local registry), or resolution would
+pick those right back.
+"""
+function strict_fallback_project(project_dir::String, fallback::Dict{Base.UUID,String};
+                                 depot::String, platform::AbstractPlatform, verbose::Bool = false)
+    fallback_dir = mktempdir()
+    project_path = Pkg.Types.projectfile_path(project_dir; strict=true)
+    project = project_path === nothing ? Dict{String,Any}() : TOML.parsefile(project_path)
+    fallback_names = Set(values(fallback))
+    for section in ("deps", "weakdeps", "extras", "sources", "compat")
+        if haskey(project, section)
+            filter!(((name, _),) -> name ∉ fallback_names, project[section])
+        end
+    end
+    open(joinpath(fallback_dir, "Project.toml"); write=true) do io
+        TOML.print(io, project)
+    end
+
+    # Resolve from scratch: the manifest of `project_dir` records the dependencies of the
+    # remaining developed JLLs on the ones we dropped.  Resolve as if for no particular
+    # Julia version, as `collect_artifact_metas()` does, so that JLLs that are also
+    # standard libraries resolve to registered versions.
+    julia_version = haskey(platform, "julia_version") ? VersionNumber(platform["julia_version"]) : nothing
+    JLLPrefixes.with_no_pkg_handrails() do; JLLPrefixes.with_no_auto_precompilation() do
+        JLLPrefixes.with_depot_path(depot) do; Pkg.activate(fallback_dir) do
+            ctx = Pkg.Types.Context(; julia_version)
+            Pkg.resolve(ctx; io=verbose ? stdout : devnull)
+        end; end
+    end; end
+    return fallback_dir
 end
 
 verify(jll::JLLSource) = !isempty(jll.artifact_paths)
