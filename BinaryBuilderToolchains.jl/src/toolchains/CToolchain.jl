@@ -158,6 +158,9 @@ struct CToolchain <: AbstractToolchain
             wrapper_prefixes...,
             extra_cflags...,
             extra_ldflags...,
+            # The software ticks flags the wrappers add (`add_softticks_flags()`): bump the
+            # version when they change, so that cached wrappers are regenerated.
+            rr_softticks(platform.target) === nothing ? "" : "softticks-wrappers-2",
         )
         cache_key = string(
             "CToolchain-",
@@ -802,17 +805,25 @@ end
     add_softticks_flags(io, toolchain)
 
 On a software ticks platform (see `rr_softticks()`), load the software ticks plugin
-into every compilation, so that the code counts its own ticks. Setting
-`BB_SOFTTICKS_DISABLE` in the environment builds without it, for code that must not
-be instrumented (a tracer that runs on the platform, say).
+into every compilation, so that the code counts its own ticks, and predefine
+`__RR_SOFTTICKS__` (the ABI version) so that code the plugin cannot instrument (loops in
+inline or hand-written assembly) can tick by hand (`rr_softticks.h`). The GCC plugin
+defines the macro itself too; an LLVM pass plugin runs after preprocessing and cannot, so
+the wrapper defines it for every vendor. Setting `BB_SOFTTICKS_DISABLE` in the environment
+builds without either, for code that must not be instrumented (a tracer that runs on the
+platform, say).
 """
 function add_softticks_flags(io, toolchain)
-    if rr_softticks(toolchain.platform.target) === nothing
+    abi = rr_softticks(toolchain.platform.target)
+    if abi === nothing
         return
     end
     compile_flagmatch(io) do io
         println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
-        append_flags(io, :PRE, ["-fplugin=\$(dirname \"\${WRAPPER_DIR}\")/softticks/lib/softticks_gcc.so"])
+        append_flags(io, :PRE, [
+            "-fplugin=\$(dirname \"\${WRAPPER_DIR}\")/softticks/lib/softticks_gcc.so",
+            "-D__RR_SOFTTICKS__=$(abi)",
+        ])
         println(io, "fi")
     end
 end
