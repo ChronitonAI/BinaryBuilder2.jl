@@ -331,6 +331,9 @@ function prepare(jlls::Vector{JLLSource};
                     artifact_metas = collect_artifact_metas(slice_deps; platform, project_dir, pkg_depot=depot, verbose)
                     art_paths = collect_artifact_paths(artifact_metas, slice_deps)
                 end
+                if !all(exempt_from_strict_tags, jlls_slice)
+                    check_strict_tags(artifact_metas, platform)
+                end
                 for jll in jlls_slice
                     pkg = only([pkg for (pkg, _) in art_paths if pkg.uuid == jll.package.uuid])
                     # Update `jll.package` with things from `pkg`
@@ -347,7 +350,6 @@ function prepare(jlls::Vector{JLLSource};
                         jll.package.repo = pkg.repo
                     end
                     append!(jll.artifact_paths, art_paths[pkg])
-                    check_rr_softticks_artifacts(jll, platform)
                     @debug("Prepared", jll, pkg, cache_path, prefix, platform)
                 end
 
@@ -386,35 +388,59 @@ function prepare(jlls::Vector{JLLSource};
 end
 
 """
-    check_rr_softticks_artifacts(jll::JLLSource, platform)
+    strict_tags
 
-On an rr software ticks platform (an `rr_softticks` tag), a dependency must provide an
-artifact built for that platform: one without the tag matches too (platform matching
-ignores tags that only one side has), but its code is not instrumented. JLLs that a
-toolchain pins to a repository and installs into a subdirectory (its sysroot) are the
-toolchain's business and are not checked.
+Platform tags that change how a build's code is generated, so that an artifact may only
+stand in for a platform that has the same value for each of them, including the tag being
+absent on both sides.  Platform matching ignores tags that only one side has, so without
+this a dependency for an `x86_64-linux-gnu-sanitize+memory` build would happily resolve to
+the uninstrumented `x86_64-linux-gnu` artifact when the JLL has no instrumented build, and
+a build for a platform without the tag could end up with an instrumented artifact.
+
+`prepare()` checks every artifact it selects for a `JLLSource` (including transitive
+dependencies) against this list and throws an error on mismatch.  Packages that define
+their own build-affecting tags can extend it with `push!(strict_tags, "mytag")`.
+
+`rr_softticks` (code instrumented to count its own ticks, see
+`BinaryBuilderPlatformExtensions.rr_softticks()`) is one such tag: an rr_softticks build
+must not link uninstrumented dependencies, and host tools must not be instrumented ones.
 """
-function check_rr_softticks_artifacts(jll::JLLSource, platform::AbstractPlatform)
-    abi = get(tags(platform), "rr_softticks", nothing)
-    if abi === nothing || !isempty(jll.target) || jll.package.repo.source !== nothing
-        return
-    end
-    pkg_dir = jll.package.path
-    if pkg_dir === nothing && jll.package.tree_hash !== nothing
-        pkg_dir = Pkg.Operations.find_installed(jll.package.name, jll.package.uuid, jll.package.tree_hash)
-    end
-    artifacts_toml = pkg_dir === nothing ? "" : joinpath(pkg_dir, "Artifacts.toml")
-    isfile(artifacts_toml) || return
-    selected = Set(basename.(jll.artifact_paths))
-    for (_, entries) in TOML.parsefile(artifacts_toml)
-        for entry in (entries isa AbstractVector ? entries : [entries])
-            entry isa AbstractDict || continue
-            get(entry, "git-tree-sha1", "") in selected || continue
-            # Platform-independent artifacts (no `arch`) hold no code.
-            haskey(entry, "arch") || continue
-            if get(entry, "rr_softticks", nothing) != abi
-                error("$(jll.package.name) has no artifact built for rr_softticks=$(abi) ",
-                      "(selected: $(get(entry, "git-tree-sha1", "?"))); build it for this platform first")
+const strict_tags = Set{String}(["sanitize", "rr_softticks"])
+
+"""
+    exempt_from_strict_tags(jll::JLLSource)
+
+JLLs that a toolchain pins to a specific repository and installs into a subdirectory of
+the prefix (e.g. a sysroot's libc, or a compiler's support libraries) are part of that
+toolchain: they are requested for the target platform, but by design they are not built
+once per value of a `strict_tags` tag, so they are not checked.
+"""
+exempt_from_strict_tags(jll::JLLSource) = jll.package.repo.source !== nothing && !isempty(jll.target)
+
+"""
+    check_strict_tags(artifact_metas::Dict, platform::AbstractPlatform)
+
+Throw an error if any of the artifacts selected in `artifact_metas` (as returned by
+`collect_artifact_metas()` for `platform`) disagrees with `platform` on a tag in
+`strict_tags`.
+"""
+function check_strict_tags(artifact_metas::Dict, platform::AbstractPlatform)
+    platform_tags = tags(platform)
+    for (pkg, meta) in artifact_metas
+        # JLLs without an artifact for this platform, and platform-independent
+        # artifacts (they hold no compiled code), have nothing to check.
+        if !haskey(meta, "git-tree-sha1") || !haskey(meta, "arch")
+            continue
+        end
+        for tag in strict_tags
+            wanted = get(platform_tags, tag, nothing)
+            selected = get(meta, tag, nothing)
+            if wanted != selected
+                describe(v) = v === nothing ? "no `$(tag)` tag" : "`$(tag)=$(v)`"
+                error("$(pkg.name) has no artifact for $(triplet(platform)): ",
+                      "the platform has $(describe(wanted)), but the best match ",
+                      "($(meta["git-tree-sha1"])) has $(describe(selected)), ",
+                      "and `$(tag)` must match exactly (see `BinaryBuilderSources.strict_tags`).")
             end
         end
     end
