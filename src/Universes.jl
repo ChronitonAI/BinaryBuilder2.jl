@@ -298,7 +298,7 @@ A depot that shares everything with the universe's depot except for its local re
 (`BB2LocalRegistry`): it sees only the upstream registries (e.g. `General`).  JLLs built in
 a universe are developed into its environment and registered into its local registry at
 versions above the upstream ones; for a platform that none of their artifacts strictly
-matches (see `BinaryBuilderSources.strict_tags`), `prepare()` resolves them in this depot
+matches (see `BinaryBuilderSources.strict_tags()`), `prepare()` resolves them in this depot
 instead, so that they (and their dependencies) come from the upstream registries.
 """
 function upstream_depot_path(u::Universe)
