@@ -2,8 +2,58 @@ export CToolchain
 using Pkg, SHA
 using Pkg.Types: PackageSpec, VersionSpec
 
-# The software ticks plugins (`add_softticks_flags()`), one per compiler.
-const softticks_plugin_jlls = ("GCCSoftTicksPlugin_jll", "LLVMSoftTicksPlugin_jll")
+# The software ticks plugins (`add_softticks_flags()`), one per compiler.  The bootstrap
+# GCC gets its own build of the GCC plugin (a GCC plugin is built against one GCC).
+const softticks_plugin_jlls = ("GCCSoftTicksPlugin_jll", "LLVMSoftTicksPlugin_jll", "GCCBootstrapSoftTicksPlugin_jll")
+
+"""
+    toolchain_universe()
+
+The `Universe` directory named by `ENV["BINARYBUILDER_TOOLCHAIN_UNIVERSE"]`, or `nothing`.
+A JLL that a toolchain pins to a repository is taken from there instead when that universe
+has developed it with an artifact for the requested platform (see
+`use_toolchain_universe!()`): this is how a new platform, or one with a strict tag such as
+`rr_softticks`, gets toolchain runtimes (libc, GCC's runtime libraries, ...) built for it
+without them being deployed to the pinned repositories.
+"""
+function toolchain_universe()
+    dir = get(ENV, "BINARYBUILDER_TOOLCHAIN_UNIVERSE", "")
+    return isempty(dir) ? nothing : dir
+end
+
+"""
+    use_toolchain_universe!(jlls::Vector{JLLSource}, universe = toolchain_universe())
+
+Point each repository-pinned JLL in `jlls` that `universe` has developed (in
+`<universe>/dev/<name>`, a git repository holding the JLL as built) with an artifact for
+the JLL's platform (and, if it pins a version, of the same major and minor version) at that
+repository's `HEAD` instead.
+"""
+function use_toolchain_universe!(jlls::Vector{JLLSource}, universe = toolchain_universe())
+    universe === nothing && return jlls
+    for jll in jlls
+        jll.package.repo.source === nothing && continue
+        dev_dir = joinpath(universe, "dev", jll.package.name)
+        artifacts_toml = joinpath(dev_dir, "Artifacts.toml")
+        isfile(artifacts_toml) || continue
+        # A pinned version (e.g. glibc 2.17) must be the one developed there, up to the patch
+        pin_version = jll.package.version
+        if isa(pin_version, VersionNumber)
+            dev_version = VersionNumber(get(Pkg.TOML.parsefile(joinpath(dev_dir, "Project.toml")), "version", "0"))
+            if (dev_version.major, dev_version.minor) != (pin_version.major, pin_version.minor)
+                continue
+            end
+        end
+        platform = BinaryBuilderSources.resolution_platform(jll)
+        if Pkg.Artifacts.artifact_meta(jll.package.name[1:end-4], artifacts_toml; platform) === nothing
+            continue
+        end
+        rev = readchomp(BinaryBuilderSources.BinaryBuilderGitUtils.git(["-C", dev_dir, "rev-parse", "HEAD"]))
+        @debug("Using the toolchain universe's build", jll=jll.package.name, dev_dir, rev)
+        jll.package.repo = Pkg.Types.GitRepo(; source=dev_dir, rev)
+    end
+    return jlls
+end
 
 struct CToolchain <: AbstractToolchain
     platform::CrossPlatform
@@ -124,6 +174,8 @@ struct CToolchain <: AbstractToolchain
             compiler_runtime,
             cxx_runtime,
         )
+
+        use_toolchain_universe!(deps)
 
         # Concretize the JLLSource's `PackageSpec`'s version (and UUID) now. Not the
         # software ticks plugins: they are resolved with the build's other dependencies,
@@ -517,6 +569,16 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
                 libc_jlls...,
             ])
         else
+            # Software ticks platforms compile with the software ticks plugin, built
+            # against this GCC (see the `:gcc` vendor below).
+            if rr_softticks(platform.target) !== nothing
+                push!(deps, JLLSource(
+                    "GCCBootstrapSoftTicksPlugin_jll",
+                    platform.host;
+                    version=v"14.2.0",
+                    target="softticks",
+                ))
+            end
             push!(deps, JLLSource(
                 "GCCBootstrap_jll",
                 platform;

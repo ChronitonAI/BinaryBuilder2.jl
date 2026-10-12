@@ -1,5 +1,6 @@
 using Test, BinaryBuilderSources, BinaryBuilderToolchains, BinaryBuilderPlatformExtensions, Base.BinaryPlatforms, Scratch
 using BinaryBuilderToolchains: path_appending_merge
+import Pkg, TOML
 
 # Enable this for lots of JLLPrefixes output
 const verbose = false
@@ -231,6 +232,41 @@ ENV["TESTSUITE_OUTPUT_DIR"] = mktempdir(;cleanup=false)
             for jll in headers
                 plain_jll = only(filter(j -> j.package.name == jll.package.name, plain.deps))
                 @test basename.(jll.artifact_paths) == basename.(plain_jll.artifact_paths)
+            end
+        end
+    end
+
+    # A toolchain universe's build of a pinned JLL replaces the pin, for the platforms
+    # (and versions) it has artifacts for
+    @testset "toolchain universe" begin
+        plain_cp = CrossPlatform(BBHostPlatform() => HostPlatform())
+        headers = only(filter(j -> j.package.name == "LinuxKernelHeaders_jll", CToolchain(plain_cp; use_ccache=false).deps))
+        prepare([headers])
+        mktempdir() do universe
+            dev_dir = joinpath(universe, "dev", "LinuxKernelHeaders_jll")
+            mkpath(dirname(dev_dir))
+            cp(Pkg.Operations.find_installed("LinuxKernelHeaders_jll", headers.package.uuid, headers.package.tree_hash), dev_dir)
+            chmod(dev_dir, 0o755; recursive=true)
+            # Only the host architecture's artifacts
+            artifacts_toml = joinpath(dev_dir, "Artifacts.toml")
+            artifacts = TOML.parsefile(artifacts_toml)
+            for (_, entries) in artifacts
+                entries isa Vector && filter!(e -> get(e, "arch", "") == arch(HostPlatform()), entries)
+            end
+            open(io -> TOML.print(io, artifacts), artifacts_toml; write=true)
+            git = BinaryBuilderSources.BinaryBuilderGitUtils.git
+            run(git(["-C", dev_dir, "init", "-q"]))
+            run(git(["-C", dev_dir, "add", "-A"]))
+            run(git(["-C", dev_dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "dev"]))
+            pick(platform) = only(filter(j -> j.package.name == "LinuxKernelHeaders_jll",
+                                         BinaryBuilderToolchains.use_toolchain_universe!(CToolchain(platform; use_ccache=false).deps, universe)))
+            @test pick(plain_cp).package.repo.source == dev_dir
+            # No artifact for this one
+            other = CrossPlatform(BBHostPlatform() => Platform(arch(HostPlatform()) == "x86_64" ? "aarch64" : "x86_64", "linux"))
+            @test startswith(pick(other).package.repo.source, "https://")
+            withenv("BINARYBUILDER_TOOLCHAIN_UNIVERSE" => universe) do
+                ct = CToolchain(plain_cp; use_ccache=false)
+                @test only(filter(j -> j.package.name == "LinuxKernelHeaders_jll", ct.deps)).package.repo.source == dev_dir
             end
         end
     end

@@ -44,7 +44,7 @@ struct BinutilsToolchain <: AbstractToolchain
         return new(
             platform,
             vendor,
-            binutils_jll_source_selection(vendor, platform),
+            use_toolchain_universe!(binutils_jll_source_selection(vendor, platform)),
             wrapper_prefixes,
             env_prefixes,
             use_ccache,

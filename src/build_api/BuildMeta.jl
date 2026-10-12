@@ -219,7 +219,12 @@ function parse_build_tarballs_args(ARGS::Vector{String})
 
     # Slurp up the last argument as platforms
     if length(ARGS) == 1
-        parsed_kwargs[:target_list] = parse.(AbstractPlatform, split(ARGS[1], ","))
+        # A triplet with the target encoded in tags (as `triplet(::CrossPlatform)` prints
+        # it) is a `CrossPlatform`, for recipes that build for those (e.g. compilers).
+        parsed_kwargs[:target_list] = map(split(ARGS[1], ",")) do t
+            p = parse(AbstractPlatform, t)
+            return isa(p, Platform) && haskey(tags(p), "target_os") ? CrossPlatform(p) : p
+        end
     elseif length(ARGS) > 1
         throw(ArgumentError("Extraneous arguments to `build_tarballs.jl`: $(join([string("\"", x, "\"") for x in ARGS[2:end]], " "))"))
     end

@@ -36,6 +36,11 @@ CT_LOCAL_TARBALLS_DIR="${WORKSPACE}/srcdir"
 
 # We always want to build g++
 CT_CC_LANG_CXX=y
+
+# GCC plugin support (implied by binutils plugin support), so that the bootstrap
+# compiler can load e.g. rr's software ticks plugin
+CT_BINUTILS_PLUGINS=y
+CT_CC_GCC_ENABLE_PLUGINS=y
 EOF
 
 # Handle OS stuff
