@@ -278,6 +278,14 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
                               cxx_runtime)
     # Collect our JLLSource objects for all of our compiler pieces:
     deps = JLLSource[]
+
+    # The sysroots and runtime libraries below are installed for `platform.target`, but
+    # they are part of the toolchain and not built once per value of a strict platform tag
+    # such as `sanitize` (see `BinaryBuilderSources.strict_tags`): a toolchain for
+    # `x86_64-linux-gnu-sanitize+memory` uses the same glibc, libgcc, libstdc++, etc...
+    # as one for `x86_64-linux-gnu`, so they opt out with `exempt_from_strict_tags`.
+    # (The compilers themselves are installed for the `CrossPlatform`, where the target's
+    # tags are prefixed with `target_` and so aren't strict.)
     sysroot_path = joinpath(get_simple_vendor(vendor), triplet(gcc_platform(platform.target)))
 
     if libc(platform.target) == "glibc"
@@ -299,6 +307,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         libc_jlls = [JLLSource(
             "Glibc_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("452aa2e7-e185-58db-8ff9-d3c1fa4bc997"),
             # TODO: Should we encode this in the platform object somehow?
             version=glibc_version,
@@ -310,6 +319,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         libc_jlls = [JLLSource(
             "Musl_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
                 source="https://github.com/staticfloat/Musl_jll.jl"
@@ -320,6 +330,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         macos_sdk_jll = JLLSource(
             "macOSSDK_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             repo=Pkg.Types.GitRepo(
                 source="https://github.com/staticfloat/macOSSDK_jll.jl",
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -337,6 +348,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         libc_jlls = [JLLSource(
             "Mingw_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
                 source="https://github.com/staticfloat/Mingw_jll.jl",
@@ -347,6 +359,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         freebsd_sdk_jll = JLLSource(
             "FreeBSDSysroot_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("671a10c0-f9bf-59ae-b52a-dff4adda89ae"),
             repo=Pkg.Types.GitRepo(
                 source="https://github.com/staticfloat/FreeBSDSysroot_jll.jl",
@@ -365,6 +378,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         JLLSource(
             "GCC_support_libraries_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("465c4c53-7f13-5720-b733-07d6cbd50c3b"),
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -376,6 +390,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         JLLSource(
             "GCC_crt_objects_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("7bc14925-bf4e-535d-80f2-90698dc22d13"),
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -390,6 +405,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         JLLSource(
             "LLVMCompilerRT_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("4e17d02c-6bf5-513e-be62-445f41c75a11"),
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -404,6 +420,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         JLLSource(
             "libstdcxx_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("3ba1ab17-c18f-5d2d-9d5a-db37f286de95"),
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -417,6 +434,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         JLLSource(
             "LLVMLibcxx_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("899a7460-a157-599b-96c7-ccb58ef9beb5"),
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -428,6 +446,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         JLLSource(
             "LLVMLibunwind_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             uuid=Base.UUID("871c935c-5660-55ad-bb68-d1283357316b"),
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
@@ -531,6 +550,7 @@ function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
         push!(deps, JLLSource(
             "LinuxKernelHeaders_jll",
             platform.target;
+            exempt_from_strict_tags=true,
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
                 source="https://github.com/staticfloat/LinuxKernelHeaders_jll.jl"
