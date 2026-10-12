@@ -1,7 +1,7 @@
 using Test, BinaryBuilderSources, SHA, Base.BinaryPlatforms, Pkg, TreeArchival
 using BinaryBuilderSources: verify, download_cache_path, source_download_cache, generated_source_cache
 using BinaryBuilderSources: registry_slice_hash, full_registries_hash
-using BinaryBuilderSources: strict_tags, check_strict_tags!, drop_strict_tags, resolution_platform
+using BinaryBuilderSources: strict_tags, drop_strict_tags, resolution_platform
 using BinaryBuilderSources: has_strictly_matching_artifact, developed_jlls_without_strict_match
 using JLLPrefixes, TOML
 using Pkg.Registry: RegistryInstance
@@ -383,9 +383,7 @@ const binlib = Sys.iswindows() ? "bin" : "lib"
                 depot = BinaryBuilderSources.default_jll_source_depot()
 
                 @test "sanitize" in strict_tags()
-                if isdefined(Base.BinaryPlatforms, :strict_presence_tags)
-                    @test strict_tags() == Tuple(Base.BinaryPlatforms.strict_presence_tags)
-                end
+                @test strict_tags() === Base.BinaryPlatforms.strict_presence_tags
                 # The list is read at runtime, so replacing Base's binding (as ygglet does to add
                 # `rr_softticks`) takes effect; done in a subprocess to leave this session's Base alone
                 if isdefined(Base.BinaryPlatforms, :strict_presence_tags)
@@ -401,21 +399,6 @@ const binlib = Sys.iswindows() ? "bin" : "lib"
                 @test drop_strict_tags(msan) == plain
                 @test drop_strict_tags(plain) === plain
                 @test haskey(tags(msan), "sanitize")
-
-                # Selected artifacts that disagree on a strict tag are dropped, as newer
-                # versions of Julia's platform matching would not have selected them
-                meta(; kwargs...) = Dict{String,Any}("git-tree-sha1" => "0"^40, "arch" => "x86_64", "os" => "linux",
-                                                     "paths" => ["/foo"], "dep_uuids" => Base.UUID[],
-                                                     (string(k) => v for (k, v) in kwargs)...)
-                metas(m) = Dict(PackageSpec(; name="Foo_jll") => m)
-                selected(ms) = only(values(ms))["paths"]
-                @test selected(check_strict_tags!(metas(meta(; sanitize="memory")), msan; depot)) == ["/foo"]
-                @test selected(check_strict_tags!(metas(meta()), plain; depot)) == ["/foo"]
-                @test isempty(selected(check_strict_tags!(metas(meta(; sanitize="memory")), plain; depot)))
-                @test isempty(selected(check_strict_tags!(metas(meta(; sanitize="address")), msan; depot)))
-                # Other tags are matched as usual, platform-independent artifacts always match
-                @test selected(check_strict_tags!(metas(meta(; cxxstring_abi="cxx11")), plain; depot)) == ["/foo"]
-                @test selected(check_strict_tags!(metas(delete!(meta(), "arch")), msan; depot)) == ["/foo"]
 
                 # `prepare()` refuses a JLL (including transitive dependencies) that only
                 # has an artifact for the platform without its strict tags...
