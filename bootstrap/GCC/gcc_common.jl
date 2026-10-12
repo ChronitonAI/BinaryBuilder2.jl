@@ -408,6 +408,8 @@ function gcc_build_spec_generator(host, platform)
         push!(target_sources, JLLSource(
             "LinuxKernelHeaders_jll",
             platform.target;
+            # Only headers, like in `CToolchain`
+            exempt_from_strict_tags=true,
             repo=Pkg.Types.GitRepo(
                 rev="bb2/GCCBootstrap-x86_64-linux-gnu",
                 source="https://github.com/staticfloat/LinuxKernelHeaders_jll.jl"
