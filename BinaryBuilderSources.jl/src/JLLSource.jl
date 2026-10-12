@@ -394,23 +394,36 @@ function prepare(jlls::Vector{JLLSource};
                     # JLLs developed in `project_dir` (e.g. built in a `Universe`) are used
                     # only for platforms that one of their artifacts strictly matches
                     # (see `strict_tags()`); for other platforms, resolve from the registries.
+                    # Only if such a JLL ends up in this slice, though: the fallback resolves
+                    # from scratch, without what `project_dir` pins.
                     slice_project_dir, slice_depot = project_dir, depot
                     fallback = developed_jlls_without_strict_match(project_dir, platform)
+                    artifact_metas = try
+                        collect_artifact_metas(slice_deps; platform, project_dir, pkg_depot=depot, verbose)
+                    catch
+                        # Maybe because of those JLLs: let the fallback decide
+                        isempty(fallback) && rethrow()
+                        nothing
+                    end
+                    if artifact_metas !== nothing &&
+                       !any(pkg -> pkg.uuid !== nothing && haskey(fallback, pkg.uuid), keys(artifact_metas))
+                        empty!(fallback)
+                    end
                     if !isempty(fallback)
                         @debug("Resolving developed JLLs from the registries", platform, prefix, fallback=sort(collect(values(fallback))))
                         slice_project_dir = get!(fallback_projects, Set(keys(fallback))) do
                             strict_fallback_project(project_dir, fallback; depot=fallback_depot, platform, verbose)
                         end
                         slice_depot = fallback_depot
-                    end
-                    artifact_metas = try
-                        collect_artifact_metas(slice_deps; platform, project_dir=slice_project_dir, pkg_depot=slice_depot, verbose)
-                    catch
-                        fallen_back = [jll.package.name for jll in jlls_slice if haskey(fallback, jll.package.uuid)]
-                        if !isempty(fallen_back)
-                            @error("Unable to resolve JLLs from the registries for $(triplet(platform)): the versions developed in $(project_dir) have no artifact for it (see `BinaryBuilderSources.strict_tags()`)", jlls=fallen_back)
+                        artifact_metas = try
+                            collect_artifact_metas(slice_deps; platform, project_dir=slice_project_dir, pkg_depot=slice_depot, verbose)
+                        catch
+                            fallen_back = [jll.package.name for jll in jlls_slice if haskey(fallback, jll.package.uuid)]
+                            if !isempty(fallen_back)
+                                @error("Unable to resolve JLLs from the registries for $(triplet(platform)): the versions developed in $(project_dir) have no artifact for it (see `BinaryBuilderSources.strict_tags()`)", jlls=fallen_back)
+                            end
+                            rethrow()
                         end
-                        rethrow()
                     end
                     check_strict_tags!(artifact_metas, platform; depot=slice_depot)
                     art_paths = collect_artifact_paths(artifact_metas, slice_deps)
