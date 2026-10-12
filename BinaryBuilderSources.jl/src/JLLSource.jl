@@ -202,6 +202,9 @@ function spec_hash(jll::JLLSource; registries::Vector{Pkg.Registry.RegistryInsta
         something(pkg.repo.source, ""),
         something(pkg.repo.rev, ""),
         triplet(resolution_platform(jll)),
+        # Which tags are strict decides which artifacts may be selected, and the list
+        # can change at runtime (see `strict_tags()`).
+        join(strict_tags(), ","),
         jll.target,
         # And then we add in registry information to be sensitive to that as well.  We
         # only mix in the slice of the registries that this JLL can actually resolve
