@@ -237,6 +237,47 @@ function Base.show(io::IO, config::BuildConfig)
     print(io, "BuildConfig($(config.src_name), $(config.src_version), $(target_platform_string(config)))")
 end
 
+"""
+    universe_jll_hashes(config::BuildConfig)
+
+The JLLs developed in `config`'s universe (the ones it built) that the JLL sources of
+`config` reach through the universe's environment, directly or as dependencies of other
+JLLs, each with a hash of its `Project.toml` and `Artifacts.toml`, sorted by name.
+Rebuilding a JLL in the universe changes both files.
+"""
+function universe_jll_hashes(config::BuildConfig)
+    manifest_path = joinpath(dirname(environment_path(AbstractBuildMeta(config).universe)), "Manifest.toml")
+    isfile(manifest_path) || return Pair{String,String}[]
+    manifest = get(TOML.parsefile(manifest_path), "deps", Dict{String,Any}())
+    frontier = String[]
+    for srcs in values(config.source_trees), src in srcs
+        src isa JLLSource && push!(frontier, src.package.name)
+    end
+    seen = Set{String}(frontier)
+    hashes = Pair{String,String}[]
+    while !isempty(frontier)
+        name = pop!(frontier)
+        entries = get(manifest, name, nothing)
+        entries === nothing && continue
+        entry = first(entries)
+        if haskey(entry, "path")
+            content = IOBuffer()
+            for f in ("Project.toml", "Artifacts.toml")
+                path = joinpath(entry["path"], f)
+                print(content, isfile(path) ? bytes2hex(sha1(read(path))) : "-", ";")
+            end
+            push!(hashes, name => String(take!(content)))
+        end
+        deps = get(entry, "deps", String[])
+        for dep in (deps isa AbstractDict ? keys(deps) : deps)
+            dep in seen && continue
+            push!(seen, dep)
+            push!(frontier, dep)
+        end
+    end
+    return sort!(hashes; by=first)
+end
+
 function BinaryBuilderSources.spec_hash(config::BuildConfig; force_recompute::Bool = false)
     if config.spec_hash[] !== nothing && !force_recompute
         return config.spec_hash[]::SHA1Hash
@@ -273,6 +314,14 @@ function BinaryBuilderSources.spec_hash(config::BuildConfig; force_recompute::Bo
             # for dep in deps
             #     println(hash_buffer, "    - $(source_str(dep)) $(spec_hash(dep))")
             # end
+        end
+
+        # The JLLs the universe has built are resolved through its environment, so the
+        # (unresolved) JLL sources above look the same before and after one is rebuilt:
+        # add the content of each developed JLL that this build's JLLs can reach.
+        println(hash_buffer, "[universe_jlls]")
+        for (name, content) in universe_jll_hashes(config)
+            println(hash_buffer, "  $(name) = $(content)")
         end
 
         # Next, the subset of the environment that includes all `BinaryBuilder*` packages
