@@ -25,10 +25,39 @@ struct JLLSource <: AbstractSource
     warn_on_overwrite::Bool
 
     # Defaults to `false`.  Turn this on for JLLs that are requested for a platform
-    # carrying a strict tag (see `strict_tags()`) but are by design not built once per
+    # carrying a strict tag (see `strict_tags`) but are by design not built once per
     # value of that tag, such as the target runtime libraries and sysroots that a
     # toolchain installs.  These get resolved as if the platform lacked the strict tags.
     exempt_from_strict_tags::Bool
+
+    # A copy of `package` as it was requested, taken before `prepare()` fills the
+    # results of resolution (version, path, tree hash, repo) into `package`.  Never
+    # mutated; registry slicing and `dev_content_hash()` read it in `spec_hash()`.
+    spec::PkgSpec
+
+    # Everything about this request that is fixed at construction, serialized for
+    # `spec_hash()`, which appends the parts that must be read at call time.
+    input_block::String
+
+    function JLLSource(package::PkgSpec, platform::AbstractPlatform, target::String,
+                       artifact_paths::Vector{String}, warn_on_overwrite::Bool,
+                       exempt_from_strict_tags::Bool, spec::PkgSpec = deepcopy(package))
+        input_block = string(
+            "name = ", spec.name, "\n",
+            "version = ", spec.version != Pkg.Types.VersionSpec() ? string(spec.version) : "", "\n",
+            "path = ", something(spec.path, ""), "\n",
+            "tree_hash = ", something(spec.tree_hash, ""), "\n",
+            "repo_source = ", something(spec.repo.source, ""), "\n",
+            "repo_rev = ", something(spec.repo.rev, ""), "\n",
+            "platform = ", triplet(platform), "\n",
+            "exempt_from_strict_tags = ", exempt_from_strict_tags, "\n",
+            # Which tags are strict decides which artifacts may be selected.
+            "strict_tags = ", join(strict_tags(), ","), "\n",
+            "target = ", target, "\n",
+        )
+        return new(package, platform, target, artifact_paths, warn_on_overwrite,
+                   exempt_from_strict_tags, spec, input_block)
+    end
 end
 
 function JLLSource(package::PkgSpec, platform::AbstractPlatform; target = "",
@@ -55,7 +84,7 @@ end
 function retarget(jll::JLLSource, new_target::String)
     noabspath!(new_target)
     return JLLSource(jll.package, jll.platform, new_target, jll.artifact_paths,
-                     jll.warn_on_overwrite, jll.exempt_from_strict_tags)
+                     jll.warn_on_overwrite, jll.exempt_from_strict_tags, jll.spec)
 end
 
 """
@@ -118,7 +147,9 @@ resolution_platform(jll::JLLSource) = jll.exempt_from_strict_tags ? drop_strict_
 When we stack multiple independent resolutions of packages together into a
 single prefix, we sometimes try to install dependencies more than once.  This
 method deduplicates JLLs by attempting to constrain down to a single version
-bound that satisfies all duplicate JLLs.  Usage:
+bound that satisfies all duplicate JLLs.  A JLL whose version gets narrowed this way
+is replaced by a new `JLLSource` requesting the narrowed version; the given JLLs are
+not modified.  Usage:
 
 ```
 jlls = deduplicate_jlls(jlls)
@@ -151,12 +182,18 @@ function deduplicate_jlls(jlls::Vector{JLLSource})
         k_idx = findfirst(((k,j),) -> k == key, seen_jlls)
         if k_idx !== nothing
             seen_jll = seen_jlls[k_idx][2]
-            # Compute new version that is the intersection of the versions
-            new_version = insersect_versions(seen_jll.package.version, jll.package.version)
+            # Compute new version that is the intersection of the requested versions
+            new_version = insersect_versions(seen_jll.spec.version, jll.spec.version)
             if !isa(new_version, VersionNumber) && isempty(new_version)
-                throw(ArgumentError("Impossible constraints on $(jll.package.name): $(seen_jll.package.version) ∩ $(jll.package.version)"))
+                throw(ArgumentError("Impossible constraints on $(jll.package.name): $(seen_jll.spec.version) ∩ $(jll.spec.version)"))
             end
-            seen_jll.package.version = new_version
+            package = deepcopy(seen_jll.package)
+            package.version = new_version
+            spec = deepcopy(seen_jll.spec)
+            spec.version = new_version
+            seen_jlls[k_idx] = (key, JLLSource(package, seen_jll.platform, seen_jll.target,
+                                               copy(seen_jll.artifact_paths), seen_jll.warn_on_overwrite,
+                                               seen_jll.exempt_from_strict_tags, spec))
         else
             push!(seen_jlls, (key, jll))
         end
@@ -176,10 +213,12 @@ compilation caches and logs.
 function make_thin_depot!(thin_depot::String, parent_depot::String = first(Base.DEPOT_PATH))
     mkpath(thin_depot)
     for store_name in ("artifacts", "packages", "compiled", "logs")
+        target_path = joinpath(parent_depot, store_name)
+        mkpath(target_path)
         store_path = joinpath(thin_depot, store_name)
         if !ispath(store_path) || !islink(store_path)
             rm(store_path; recursive=true, force=true)
-            symlink(joinpath(parent_depot, store_name), store_path; dir_target=true)
+            symlink(target_path, store_path; dir_target=true)
         end
     end
 end
@@ -195,32 +234,19 @@ end
 
 # This is different from `content_hash()` in that it represents all the _inputs_
 # for this `JLLSource`, but not the _output_ of resolution.  This is used to
-# build a mapping from inputs to outputs for caching.
+# build a mapping from inputs to outputs for caching.  The parts of the request
+# that can't change are in `jll.input_block`; the rest are read here, on every call.
 function spec_hash(jll::JLLSource; registries::Vector{Pkg.Registry.RegistryInstance})
-    pkg = jll.package
     return SHA1Hash(sha1(string(
-        # These pieces of information are meant to be sensitive to anything that
-        # could cause us to resolve to a different `artifact_path`, regardless of
-        # changes to the registry.
-        pkg.name,
-        pkg.version != Pkg.Types.VersionSpec() ? string(pkg.version) : "",
-        something(pkg.path, ""),
+        jll.input_block,
         # A JLL developed by path (as a `Universe` does with what it builds) changes in
         # place when it is rebuilt: its path alone would keep stale caches alive.
-        dev_content_hash(pkg),
-        something(pkg.tree_hash, ""),
-        something(pkg.repo.source, ""),
-        something(pkg.repo.rev, ""),
-        triplet(resolution_platform(jll)),
-        # Which tags are strict decides which artifacts may be selected, and the list
-        # can change at runtime (see `strict_tags()`).
-        join(strict_tags(), ","),
-        jll.target,
+        "dev_content = ", dev_content_hash(jll.spec), "\n",
         # And then we add in registry information to be sensitive to that as well.  We
         # only mix in the slice of the registries that this JLL can actually resolve
         # against, so that the constant churn of unrelated packages in `General` doesn't
         # invalidate our caches.
-        registry_slice_hash(pkg, registries),
+        "registry_slice = ", registry_slice_hash(jll.spec, registries), "\n",
     )))
 end
 function dev_content_hash(pkg)
@@ -231,6 +257,38 @@ function dev_content_hash(pkg)
         h *= isfile(path) ? bytes2hex(sha1(read(path))) : "-"
     end
     return h
+end
+
+"""
+    tracks_branch(pkg::PkgSpec)
+
+Return `true` if `pkg` is added from a git repository by branch (or by the repository's
+default branch) rather than by a commit, meaning that what it resolves to can change at
+any moment.  Note that we treat any `rev` that isn't a full commit hash (such as a tag)
+as a branch.
+"""
+function tracks_branch(pkg::PkgSpec)
+    pkg.repo.source === nothing && return false
+    return pkg.repo.rev === nothing || !occursin(r"^[0-9a-f]{40}$", pkg.repo.rev)
+end
+
+"""
+    project_dep_uuids(pkg::PkgSpec)
+
+Return the UUIDs of the dependencies listed in the `Project.toml` of a package that
+is developed by path.  Returns `nothing` for any other package, or if it has no
+`Project.toml`.
+"""
+function project_dep_uuids(pkg::PkgSpec)
+    pkg.path === nothing && return nothing
+    for name in Base.project_names
+        path = joinpath(pkg.path, name)
+        if isfile(path)
+            deps = get(TOML.parsefile(path), "deps", Dict{String,Any}())
+            return [Base.UUID(uuid) for uuid in values(deps)]
+        end
+    end
+    return nothing
 end
 
 function jll_cache_name(jlls::Vector{JLLSource}, registries::Vector{Pkg.Registry.RegistryInstance})
@@ -320,6 +378,12 @@ function prepare(jlls::Vector{JLLSource};
             # Check to see if this slice of JLLs has been resolved before:
             cache_path = jll_cache_path(jlls_slice)
 
+            # A JLL that tracks a branch must be resolved by `Pkg` every time, so a slice
+            # containing one is neither loaded from the cache nor stored into it.  Its `spec_hash()`
+            # only knows the branch name, so the cache would happily hand us whatever the
+            # branch pointed to back when we first resolved it.
+            slice_tracks_branch = any(tracks_branch(jll.package) for jll in jlls_slice)
+
             # If we decide the cache is stale, we do this to clear it
             function clear_cache!()
                 for jll in jlls_slice
@@ -336,7 +400,7 @@ function prepare(jlls::Vector{JLLSource};
             end
 
             # If we have a cache path, try to load artifact paths for any JLL in the cache
-            if ispath(cache_path)
+            if ispath(cache_path) && !slice_tracks_branch
                 cache = TOML.parsefile(cache_path)
 
                 # Whether to load this cache. Either way the slice is resolved below if any
@@ -460,7 +524,7 @@ function prepare(jlls::Vector{JLLSource};
 
                 # Write out the result into a cache so we don't have to go through this resolution again.
                 # Only do that if all jll's had a `tree_hash`:
-                if all(jll.package.tree_hash !== nothing for jll in jlls_slice)
+                if !slice_tracks_branch && all(jll.package.tree_hash !== nothing for jll in jlls_slice)
                     # Record here all recursive dependencies of the slice_deps, so that if we know one of
                     # these is changed (e.g. by being built as part of the current universe), then we
                     # invalidate this entire slice.
@@ -518,7 +582,7 @@ function check_missing_strict_artifacts(artifact_metas::Dict, platform::Abstract
         if unstrict_meta !== nothing
             present = join(("`$(tag)=$(platform_tags[tag])`" for tag in strict_tags() if haskey(platform_tags, tag)), ", ")
             error("$(pkg.name) has no artifact for $(triplet(platform)), only for $(triplet(unstrict_platform)); ",
-                  "$(present) must match exactly (see `BinaryBuilderSources.strict_tags()`, ",
+                  "$(present) must match exactly (see `BinaryBuilderSources.strict_tags`, ",
                   "and `exempt_from_strict_tags` for JLLs that are not built per value of these tags)")
         end
     end
@@ -637,6 +701,7 @@ function strict_fallback_project(project_dir::String, fallback::Dict{Base.UUID,S
     end; end
     return fallback_dir
 end
+
 
 verify(jll::JLLSource) = !isempty(jll.artifact_paths)
 

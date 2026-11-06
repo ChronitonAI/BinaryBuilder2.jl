@@ -8,16 +8,17 @@ include("SystemLibraries.jl")
 include("AuditorToolchain.jl")
 include("Scanning.jl")
 include("AuditResult.jl")
+include("AuditInfo.jl")
 include("LdScriptParser.jl")
 include("passes/RelativeSymlink.jl")
 include("passes/LibrarySONAME.jl")
 include("passes/DynamicLinkage.jl")
+include("passes/StaticLibraries.jl")
 include("passes/Licenses.jl")
 
-
 function audit!(prefix::String,
-                library_products::Vector{LibraryProduct},
-                dep_libs::Dict{Symbol,Vector{JLLLibraryProduct}};
+                products::Vector{<:AbstractProduct},
+                info::AuditInfo;
                 prefix_alias::String = prefix,
                 platform::AbstractPlatform = HostPlatform(),
                 env::Dict{String,String} = Dict{String,String}(
@@ -30,41 +31,40 @@ function audit!(prefix::String,
     scan = scan_files(
         prefix,
         platform,
-        library_products,
+        products,
         env,
     )
-    pass_results = Dict{String,Vector{PassResult}}()
+    result = AuditResult(scan)
 
     # First pass; symlink translation
     if !readonly
-        absolute_to_relative_symlinks!(scan, pass_results, prefix_alias)
+        absolute_to_relative_symlinks!(result, prefix_alias)
     end
 
     # Ensure that all libraries have SONAMEs
     if !readonly
-        ensure_sonames!(scan, pass_results)
+        ensure_sonames!(result)
     end
 
-    # Solve dynamic linkage, obtaining the output JLLLibraryProduct objects
-    jll_lib_products = resolve_dynamic_links!(scan, pass_results, dep_libs)
+    # Solve dynamic linkage, deriving each library product's record
+    resolve_dynamic_links!(result, info)
+
+    # Describe the static archive of each library product, if any, plus any standalone static libraries
+    resolve_static_libraries!(result, info)
 
     # Ensure that all libraries and executables have the correct RPATH setup
     if !readonly
-        rpaths_consistent!(scan, pass_results, dep_libs)
+        rpaths_consistent!(result, info)
     end
 
     # Ensure that there are some licenses
-    licenses_present(scan, pass_results)
+    licenses_present(result)
 
     if verbose
-        show(pass_results)
+        show(result.pass_results)
     end
 
-    return AuditResult(
-        scan,
-        pass_results,
-        jll_lib_products,
-    )
+    return result
 end
 
 

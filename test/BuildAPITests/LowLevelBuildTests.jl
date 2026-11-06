@@ -1,5 +1,8 @@
 using BinaryBuilder2, Test, Random
-import BinaryBuilder2: import_archives
+import BinaryBuilder2: import_archives, JLLSourceRecords
+using BinaryBuilderSources: download_cache_path, verify
+using TreeArchival: archive, treehash
+using SHA, Downloads
 
 if !isdefined(@__MODULE__, :TestingUtils)
     include(joinpath(pkgdir(BinaryBuilder2), "test", "TestingUtils.jl"))
@@ -159,6 +162,18 @@ end
         FileProduct("include/zlib.h", :zlib_h),
     ]
 
+    # Test that a failed extraction with `archive_dir` set returns a failed
+    # result (rather than throwing while trying to export an uncached
+    # extraction) and does not export anything.
+    failing_extract_config = ExtractConfig(
+        build_result,
+        raw"extract ${prefix}/lib/**.so*; rm -rf ${prefix}/lib",
+        products,
+    )
+    failing_extract_result = extract!(failing_extract_config; disable_cache=true)
+    @test failing_extract_result.status == :failed
+    @test isempty(readdir(archive_dir))
+
     extract_config = ExtractConfig(
         build_result,
         extract_script,
@@ -217,6 +232,112 @@ end
         return v.major == 99 && v.minor == 99
     end
     @test length(ninetynine_versions) == 2
+end
+
+@testset "packaging a cached build fetches no sources" begin
+    # A source tarball served from a port nothing listens on, so any attempt to
+    # download it fails.  Random content keeps the build hash unique to this run.
+    tarball_dir = mktempdir()
+    mkpath(joinpath(tarball_dir, "src", "hello"))
+    write(joinpath(tarball_dir, "src", "hello", "hello.txt"), randstring(32))
+    write(joinpath(tarball_dir, "src", "hello", "LICENSE"), "MIT")
+    tarball = joinpath(tarball_dir, "hello.tar.gz")
+    archive(joinpath(tarball_dir, "src"), tarball, "gzip")
+    source = ArchiveSource("http://127.0.0.1:1/hello.tar.gz", "sha256:" * bytes2hex(open(sha256, tarball)))
+    seed_download_cache() = (mkpath(dirname(download_cache_path(source))); cp(tarball, download_cache_path(source); force=true))
+    clear_download_cache() = rm(download_cache_path(source); force=true)
+
+    script = raw"""
+    mkdir -p ${prefix}/share
+    cp hello/hello.txt ${prefix}/share/
+    install_license hello/LICENSE
+    """
+    extract_script = raw"extract ${prefix}/share/**"
+    products = [FileProduct("share/hello.txt", :hello_txt)]
+    make_build_config(meta) = BuildConfig(meta, "Hello", v"1.0.0", [source], apply_spec_plan(spec_plan, native_linux, native_linux), script)
+
+    # The build job: the source is "downloaded" by seeding the download cache.  Like
+    # `build_tarballs()`, pass `extract_arg_hints` so the build hash is computed (and
+    # the build cache consulted) before the build starts.
+    archive_dir = mktempdir()
+    seed_download_cache()
+    build_meta = BuildMeta(; verbose=false, archive_dir)
+    build_result = build!(make_build_config(build_meta); extract_arg_hints=[(extract_script, products)])
+    @test build_result.status == :success
+    expected_records = [JLLSourceRecord(first(source.urls), SHA1Hash(treehash(tarball)))]
+    @test build_result.source_records == expected_records
+    extract_result = extract!(ExtractConfig(build_result, extract_script, products))
+    @test extract_result.status == :success
+    build_hash = string(spec_hash(build_result.config))
+    @test isfile(joinpath(archive_dir, "$(build_hash).sources.toml"))
+
+    # Like the registration job: a machine that only has the archives, not the source.
+    function cached_extract_result(archive_dir)
+        meta = BuildMeta(; verbose=false)
+        empty!(meta.build_cache.build_entries)
+        empty!(meta.build_cache.extract_entries)
+        import_archives(meta.build_cache, archive_dir)
+        cached_build = build!(make_build_config(meta); extract_arg_hints=[(extract_script, products)])
+        @test cached_build.status == :cached
+        cached_extract = extract!(ExtractConfig(cached_build, extract_script, products))
+        @test cached_extract.status == :cached
+        return cached_extract
+    end
+    clear_download_cache()
+    result = cached_extract_result(archive_dir)
+    @test result.config.build.source_records == expected_records
+    package_result = package!(PackageConfig(result))
+    @test package_result.status == :success
+    @test !verify(source)
+
+    # Archives without the source records fall back to fetching the sources
+    rm(joinpath(archive_dir, "$(build_hash).sources.toml"))
+    result = cached_extract_result(archive_dir)
+    @test result.config.build.source_records === nothing
+    @test_throws Downloads.RequestError JLLSourceRecords(result)
+    seed_download_cache()
+    @test JLLSourceRecords(result) == expected_records
+    clear_download_cache()
+end
+
+@testset "archives import into a cache that a fresh session hits" begin
+    # An uncached build exports its archives keyed by `spec_hash(config)`, which it first
+    # computes after `prepare()` has resolved the toolchain JLLs.  A later session
+    # computes it before resolving anything, and must still find those archives.
+    source_dir = mktempdir()
+    write(joinpath(source_dir, "hello.txt"), "hello $(randstring(16))\n")
+    build_script = raw"""
+    mkdir -p ${prefix}/share
+    cp hello.txt ${prefix}/share/
+    mkdir -p ${prefix}/share/licenses/hello
+    echo "public domain" > ${prefix}/share/licenses/hello/LICENSE.md
+    """
+    extract_script = raw"extract ${prefix}/share/**"
+    products = [FileProduct("share/hello.txt", :hello_txt)]
+    make_config(meta) = BuildConfig(
+        meta,
+        "hello",
+        v"1.0.0",
+        [DirectorySource(source_dir)],
+        apply_spec_plan(spec_plan, native_linux, native_linux),
+        build_script,
+    )
+
+    archive_dir = mktempdir()
+    meta = BuildMeta(; verbose=false, archive_dir)
+    build_result = build!(make_config(meta); disable_cache=true)
+    @test build_result.status == :success
+    extract_result = extract!(ExtractConfig(build_result, extract_script, products); disable_cache=true)
+    @test extract_result.status == :success
+    @test !isempty(readdir(archive_dir))
+
+    fresh_meta = BuildMeta(; verbose=false)
+    empty!(fresh_meta.build_cache.build_entries)
+    empty!(fresh_meta.build_cache.extract_entries)
+    import_archives(fresh_meta.build_cache, archive_dir)
+    @test length(fresh_meta.build_cache.build_entries) == 1
+    cached_build_result = build!(make_config(fresh_meta); extract_arg_hints=[(extract_script, products)])
+    @test cached_build_result.status == :cached
 end
 
 @testset "atomic_patch" begin

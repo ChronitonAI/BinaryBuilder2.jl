@@ -1,8 +1,8 @@
 module BinaryBuilderGitUtils
 
-using Git, MultiHashParsing, gh_cli_jll
+using Git, MultiHashParsing, gh_cli_jll, Preferences
 import Base.BinaryPlatforms: tags
-export iscommit, commit!, init!, fetch!, clone!, checkout!, push!, rebase!, remote_url, remote_url!, tags, tag!, log, log_between, head_branch, branch, branch!, isbranch
+export access_token, url_access_token, set_access_tokens!, iscommit, commit!, init!, fetch!, clone!, checkout!, push!, rebase!, remote_url, remote_url!, tags, tag!, log, log_between, head_branch, branch, branch!, isbranch
 
 # Easy converter of MultiHash objects to strings
 to_commit_str(x::String) = x
@@ -19,7 +19,158 @@ force_args(force::Bool) = force ? String["--force"] : String[]
 
 const use_gh_auth::Ref{Bool} = Ref(false)
 gh_auth_args() = ["-c", "credential.https://github.com.helper=!gh auth git-credential"]
-function git_authed(args; kwargs...)
+
+"""
+    access_tokens
+
+Tokens used to authenticate to git hosts, as a tree of nested dictionaries keyed by
+host, then organization, then repository, e.g.:
+
+    Dict(
+        "github.com" => Dict(
+            "JuliaBinaryWrappers" => "<token for all of JuliaBinaryWrappers>",
+            "JuliaRegistries" => Dict("General" => "<token for JuliaRegistries/General>"),
+        ),
+    )
+
+A token given in place of a dictionary applies to everything beneath that point, so
+mapping `"github.com"` to a token uses it for all of GitHub.  Keys are matched case-
+insensitively.  This is loaded from our `access_tokens` preference, and can be set
+through `set_access_tokens!()`.
+"""
+const access_tokens::Ref{Dict{String,Any}} = Ref(Dict{String,Any}())
+
+function check_access_tokens(tree::AbstractDict, depth::Int = 1)
+    for (key, val) in tree
+        if val isa AbstractDict
+            if depth >= 3
+                throw(ArgumentError("access_tokens: expected a token for repository '$(key)', got a dictionary"))
+            end
+            check_access_tokens(val, depth + 1)
+        elseif !isa(val, AbstractString)
+            throw(ArgumentError("access_tokens: expected a token or dictionary for '$(key)', got a $(typeof(val))"))
+        end
+    end
+end
+
+function set_access_tokens!(tree::AbstractDict)
+    check_access_tokens(tree)
+    access_tokens[] = Dict{String,Any}(tree)
+end
+
+function __init__()
+    set_access_tokens!(@load_preference("access_tokens", Dict{String,Any}()))
+end
+
+"""
+    access_token(host, org = nothing, repo = nothing)
+
+Returns the token configured in `access_tokens` for `host/org/repo`, or `nothing`.
+"""
+function access_token(host::AbstractString,
+                      org::Union{Nothing,AbstractString} = nothing,
+                      repo::Union{Nothing,AbstractString} = nothing)
+    node = access_tokens[]
+    for key in (host, org, repo)
+        if node isa AbstractString
+            return String(node)
+        end
+        if key === nothing
+            return nothing
+        end
+        idx = findfirst(k -> lowercase(k) == lowercase(key), collect(keys(node)))
+        if idx === nothing
+            return nothing
+        end
+        node = node[collect(keys(node))[idx]]
+    end
+    return node isa AbstractString ? String(node) : nothing
+end
+
+"""
+    url_access_token(url)
+
+Returns the token configured in `access_tokens` for the repository `url` points into,
+(e.g. `https://github.com/Foo/Bar.git`, `https://github.com/Foo/Bar/releases/...` or
+`https://api.github.com/repos/Foo/Bar/...`) or `nothing`.  Only `https` URLs get a token.
+"""
+function url_access_token(url::AbstractString)
+    m = match(r"^https://api\.github\.com/repos/([^/?#]+)/([^/?#]+)", url)
+    if m !== nothing
+        return access_token("github.com", m.captures[1], strip_dotgit(m.captures[2]))
+    end
+    m = match(r"^https://(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:/([^/?#]+))?(?:/([^/?#]+))?", url)
+    if m === nothing
+        return nothing
+    end
+    host, org, repo = m.captures
+    return access_token(host, org, repo === nothing ? nothing : strip_dotgit(repo))
+end
+strip_dotgit(name::AbstractString) = endswith(name, ".git") ? name[1:end-4] : name
+
+# The ambient token that `gh` would use, if any (`gh` prefers `GH_TOKEN` over `GITHUB_TOKEN`)
+env_gh_token() = get(ENV, "GH_TOKEN", get(ENV, "GITHUB_TOKEN", nothing))
+
+"""
+    scrub_token_env(cmd::Cmd)
+
+Remove the ambient GitHub token variables from `cmd`'s environment, so that they don't
+get printed along with `cmd` (e.g. when it fails with a `ProcessFailedException`).
+"""
+scrub_token_env(cmd::Cmd) = addenv(cmd, "GH_TOKEN" => nothing, "GITHUB_TOKEN" => nothing)
+
+"""
+    with_token_dir(f::Function, files::Pair{String,String}...)
+
+Call `f(dir)` with a freshly-created private directory holding the given
+`name => contents` files, and delete it as soon as `f` returns.  This is how we hand
+tokens to `git` and `gh` without placing them within the command line or environment
+of the `Cmd`, so that they never get printed alongside it, and so that they only sit
+on the filesystem while the command that needs them is running.
+"""
+function with_token_dir(f::Function, files::Pair{String,String}...)
+    # `mktempdir()` creates the directory readable only by us
+    return mktempdir() do dir
+        for (name, contents) in files
+            path = joinpath(dir, name)
+            touch(path)
+            chmod(path, 0o600)
+            write(path, contents)
+        end
+        return f(dir)
+    end
+end
+
+"""
+    git_authed(f::Function, url, args; kwargs...)
+
+Call `f(cmd)` with a `git` command running `args` against the remote at `url`,
+authenticating with its token from `access_tokens` if there is one, otherwise through
+`gh` if `use_gh_auth[]` is set.  The token is written to a `git-credential-store` file
+that only exists while `f` runs, so `f` should do nothing more than run `cmd`.
+"""
+function git_authed(f::Function, url::AbstractString, args; kwargs...)
+    token = url_access_token(url)
+    m = match(r"^https://(?:[^@/]+@)?(.*)$", url)
+    if token === nothing && use_gh_auth[] && m !== nothing && startswith(m.captures[1], "github.com/")
+        # Hand an ambient token over through the credential file as well, as the
+        # environment gets scrubbed of it below.
+        token = env_gh_token()
+    end
+
+    if token !== nothing && m !== nothing
+        credentials = string("https://x-access-token:", token, "@", m.captures[1], "\n")
+        return with_token_dir("credentials" => credentials) do dir
+            # The empty `credential.helper` resets the list of helpers, so that ours
+            # takes precedence over any that the user has configured.
+            cmd = git(vcat(
+                ["-c", "credential.helper=", "-c", "credential.helper=store --file=$(joinpath(dir, "credentials"))"],
+                args,
+            ); kwargs...)
+            return f(scrub_token_env(cmd))
+        end
+    end
+
     if use_gh_auth[]
         args = vcat(gh_auth_args(), args)
     end
@@ -30,11 +181,12 @@ function git_authed(args; kwargs...)
         pathsep = Sys.iswindows() ? ";" : ":"
         cmd.env[path_idx] = string("PATH=", gh_cli_jll.PATH[], pathsep, cmd.env[path_idx][6:end])
     end
-    return cmd
+    return f(scrub_token_env(cmd))
 end
 
 function fetch!(repo_path::String; verbose::Bool = false)
-    return run(git(["-C", repo_path, "fetch", "-a", quiet_args(verbose)...]))
+    url = "origin" ∈ remotes(repo_path) ? remote_url(repo_path) : ""
+    return git_authed(run, url, ["-C", repo_path, "fetch", "-a", quiet_args(verbose)...])
 end
 
 function init!(repo_path::String; initial_branch::String = "main", verbose::Bool = false)
@@ -81,7 +233,7 @@ function clone!(url::String, repo_path::String;
             @info("Cloning git repository", url, repo_path)
         end
         # If there is no repo_path yet, clone it down into a bare repository
-        run(git(["clone", "--mirror", url, repo_path, quiet_args(verbose)...]))
+        git_authed(run, url, ["clone", "--mirror", url, repo_path, quiet_args(verbose)...])
     end
 end
 
@@ -124,8 +276,9 @@ function commit!(checkout_path::String, message::String; verbose::Bool = false)
 end
 
 function Base.push!(repo_path::String, remote::String = "origin"; verbose::Bool = false, force::Bool = false)
-    run(git_authed(["-C", repo_path, "push", remote, force_args(force)..., quiet_args(verbose)...]))
-    run(git_authed(["-C", repo_path, "push", "--tags", remote, force_args(force)..., quiet_args(verbose)...]))
+    url = remote_url(repo_path, remote)
+    git_authed(run, url, ["-C", repo_path, "push", remote, force_args(force)..., quiet_args(verbose)...])
+    git_authed(run, url, ["-C", repo_path, "push", "--tags", remote, force_args(force)..., quiet_args(verbose)...])
 end
 
 function rebase!(checkout_path::String, target::HashOrString, verbose::Bool = false, atomic::Bool = true)

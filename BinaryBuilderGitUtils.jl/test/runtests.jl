@@ -176,3 +176,76 @@ end
         end
     end
 end
+
+@testset "access tokens" begin
+    using BinaryBuilderGitUtils: git_authed
+    old_tokens = BinaryBuilderGitUtils.access_tokens[]
+    try
+        set_access_tokens!(Dict(
+            "github.com" => Dict(
+                "JuliaBinaryWrappers" => Dict(
+                    "Zlib_jll.jl" => "zlib_token",
+                ),
+                "JuliaRegistries" => "registries_token",
+            ),
+            "gitlab.example.com" => "gitlab_token",
+        ))
+
+        @test access_token("github.com") === nothing
+        @test access_token("github.com", "JuliaBinaryWrappers") === nothing
+        @test access_token("github.com", "JuliaBinaryWrappers", "Zlib_jll.jl") == "zlib_token"
+        @test access_token("github.com", "juliabinarywrappers", "zlib_jll.jl") == "zlib_token"
+        @test access_token("github.com", "JuliaBinaryWrappers", "Bzip2_jll.jl") === nothing
+        @test access_token("github.com", "JuliaRegistries", "General") == "registries_token"
+        @test access_token("gitlab.example.com", "foo", "bar") == "gitlab_token"
+
+        @test url_access_token("https://github.com/JuliaBinaryWrappers/Zlib_jll.jl.git") == "zlib_token"
+        @test url_access_token("https://github.com/JuliaBinaryWrappers/Zlib_jll.jl") == "zlib_token"
+        @test url_access_token("https://github.com/JuliaRegistries/General.git") == "registries_token"
+        @test url_access_token("https://github.com/JuliaBinaryWrappers/Zlib_jll.jl/releases/download/v1/foo.tar.gz") == "zlib_token"
+        @test url_access_token("https://api.github.com/repos/JuliaBinaryWrappers/Zlib_jll.jl/releases/assets/1") == "zlib_token"
+        @test url_access_token("https://gitlab.example.com/foo/bar.git") == "gitlab_token"
+        @test url_access_token("https://github.com/JuliaLang/julia") === nothing
+        @test url_access_token("http://gitlab.example.com/foo/bar.git") === nothing
+        @test url_access_token("/some/local/path") === nothing
+
+        @test_throws ArgumentError set_access_tokens!(Dict("github.com" => 1))
+        @test_throws ArgumentError set_access_tokens!(Dict("a" => Dict("b" => Dict("c" => Dict()))))
+
+        # Ask `git` which password it would use for a given URL
+        all_tokens = ("zlib_token", "registries_token", "gitlab_token")
+        function credential(url)
+            git_authed(url, ["credential", "fill"]) do cmd
+                # The token must not be part of the `Cmd`, as that gets printed when it fails
+                @test !any(token -> occursin(token, repr(cmd)), all_tokens)
+                cmd = addenv(cmd, "GIT_TERMINAL_PROMPT" => "0")
+                out = read(pipeline(ignorestatus(cmd); stdin=IOBuffer("url=$(url)\n\n"), stderr=devnull), String)
+                m = match(r"^password=(.*)$"m, out)
+                return m === nothing ? nothing : m.captures[1]
+            end
+        end
+        @test credential("https://github.com/JuliaBinaryWrappers/Zlib_jll.jl.git") == "zlib_token"
+        @test credential("https://github.com/JuliaRegistries/General.git") == "registries_token"
+        @test credential("https://gitlab.example.com/foo/bar.git") == "gitlab_token"
+        @test credential("https://github.com/JuliaBinaryWrappers/Bzip2_jll.jl.git") ∉ all_tokens
+
+        # The credentials only exist on disk while the command runs
+        credentials_path = git_authed("https://github.com/JuliaRegistries/General.git", ["version"]) do cmd
+            helper = only(filter(arg -> startswith(arg, "credential.helper=store --file="), cmd.exec))
+            path = helper[length("credential.helper=store --file=")+1:end]
+            @test read(path, String) == "https://x-access-token:registries_token@github.com/JuliaRegistries/General.git\n"
+            @test filemode(path) & 0o077 == 0
+            return path
+        end
+        @test !ispath(credentials_path)
+        @test !ispath(dirname(credentials_path))
+
+        # `fetch!()` must cope with a repository that has no `origin`
+        mktempdir() do dir
+            init!(joinpath(dir, "repo"))
+            fetch!(joinpath(dir, "repo"))
+        end
+    finally
+        BinaryBuilderGitUtils.access_tokens[] = old_tokens
+    end
+end

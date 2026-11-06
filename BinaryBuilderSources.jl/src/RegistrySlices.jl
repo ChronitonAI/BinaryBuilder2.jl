@@ -48,6 +48,10 @@ function registry_fingerprint(reg::RegistryInstance)
     return string(reg.uuid, "@", bytes2hex(reg.tree_info.bytes))
 end
 
+# Pkg 1.13 takes the registry too (`registry_info(reg, entry)`); older Pkgs take the entry.
+entry_info(reg::RegistryInstance, entry::PkgEntry) =
+    applicable(registry_info, reg, entry) ? registry_info(reg, entry) : registry_info(entry)
+
 """
     registry_entry_hash(reg::RegistryInstance, entry::PkgEntry)
 
@@ -56,10 +60,6 @@ its available versions and their tree hashes, and the dependencies and compat bo
 of each of those versions.  This is deliberately insensitive to the formatting of the
 underlying `.toml` files, and to every other package in the registry.
 """
-# Pkg 1.13 takes the registry too (`registry_info(reg, entry)`); older Pkgs take the entry.
-entry_info(reg::RegistryInstance, entry::PkgEntry) =
-    applicable(registry_info, reg, entry) ? registry_info(reg, entry) : registry_info(entry)
-
 function registry_entry_hash(reg::RegistryInstance, entry::PkgEntry)
     key = (registry_fingerprint(reg), entry.uuid)
     cached = lock(() -> get(registry_entry_hashes, key, nothing), registry_slice_lock)
@@ -84,7 +84,7 @@ function registry_entry_hash(reg::RegistryInstance, entry::PkgEntry)
                     println(io, "  ", name, "[", vr, "] ", dep)
                 end
             else
-                for dep_name in sort!(collect(keys(entries)); by=string)
+                for dep_name in sort!(collect(keys(entries)))
                     println(io, "  ", name, "[", vr, "] ", dep_name, " = ", entries[dep_name])
                 end
             end
@@ -101,12 +101,24 @@ end
 """
     slice_roots(pkg::PkgSpec, registries)
 
-Return the UUIDs within `registries` that `pkg` could resolve to, or `nothing` if
-`pkg` is not registered at all.  We look packages up by name (rather than by UUID)
-because `pkg.uuid` is only filled out once `prepare()` has run, and `spec_hash()`
-must not depend on whether that has happened yet.
+Return the UUIDs within `registries` that the resolution of `pkg` starts from, or
+`nothing` if we can't tell.
+
+A package that is developed by path doesn't resolve against its own registry entry
+(if it even has one) but against the dependencies listed in its `Project.toml`, so
+those are our roots (see [`project_dep_uuids`](@ref)).  Otherwise these are the UUIDs
+that `pkg` could resolve to.  We look those up by name (rather than by UUID) because
+`pkg.uuid` is only filled out once `prepare()` has run, and `spec_hash()` must not
+depend on whether that has happened yet.
+
+A package added from a git repository needn't be registered at all, and we can't see
+its `Project.toml` without fetching it, so if it isn't registered we leave the
+registries out of it entirely rather than hash them wholesale.
 """
 function slice_roots(pkg::PkgSpec, registries::Vector{RegistryInstance})
+    if pkg.path !== nothing
+        return project_dep_uuids(pkg)
+    end
     if pkg.name !== nothing
         roots = UUID[]
         for reg in registries
@@ -118,6 +130,9 @@ function slice_roots(pkg::PkgSpec, registries::Vector{RegistryInstance})
     end
     if pkg.uuid !== nothing && any(haskey(reg.pkgs, pkg.uuid) for reg in registries)
         return [pkg.uuid]
+    end
+    if pkg.repo.source !== nothing
+        return UUID[]
     end
     return nothing
 end
@@ -138,22 +153,28 @@ end
     registry_slice_hash(pkg::PkgSpec, registries)
 
 Hash only the pieces of `registries` that can change how `pkg` resolves: the registry
-entries of `pkg` itself and, transitively, of everything it can depend on.  This is
-what lets our JLL resolution caches (and everything keyed off of them, such as
-`spec_hash(::JLLSource)`) survive a registry update that didn't touch any package we
-care about.  `General` picks up new commits every few minutes, so hashing the whole
-registry meant throwing away those caches on essentially every build.
+entries of `pkg` itself (or of the dependencies in its `Project.toml`, for a package
+developed by path; see [`slice_roots`](@ref)) and, transitively, of everything they
+can depend on.  This is what lets our JLL resolution caches (and everything keyed off
+of them, such as `spec_hash(::JLLSource)`) survive a registry update that didn't touch
+any package we care about.  `General` picks up new commits every few minutes, so
+hashing the whole registry meant throwing away those caches on essentially every build.
 
 We walk dependencies of *every* version of *every* package we reach, not just the
 versions that happen to resolve today, because a new version of any of them is exactly
-the kind of registry change that should invalidate the cache.  In practice these
-closures are small: a leaf JLL reaches a handful of packages, and a heavy one like
-`Qt6Base_jll` reaches a few dozen.
+the kind of registry change that should invalidate the cache.  We do not walk weak
+dependencies, as they can never pull a package into a resolution; their compat bounds
+are still part of each entry's hash (see [`registry_entry_hash`](@ref)).  Walking them
+too would reach most of `General` (e.g. `LazyJLLWrappers` reaches `JET` through a
+chain of package extensions), at which point every `General` commit would invalidate
+everything.  Without them, these closures are small: a leaf JLL reaches a handful of
+packages, and a heavy one like `Qt6Base_jll` reaches a few dozen.
 
 Only tarball registries take part in this (see [`tarball_registries`](@ref)); a
-`Universe`'s local registry contributes nothing.  If `pkg` isn't registered in any
-tarball registry we can't compute a closure, so we fall back to hashing those
-registries in their entirety.
+`Universe`'s local registry contributes nothing.  If we can't find any roots for `pkg`
+(it isn't registered in any tarball registry, and doesn't come from a path or a git
+repository) we can't compute a closure, so we fall back to hashing those registries in
+their entirety.
 """
 function registry_slice_hash(pkg::PkgSpec, registries::Vector{RegistryInstance})
     registries = tarball_registries(registries)
@@ -180,14 +201,12 @@ function registry_slice_hash(pkg::PkgSpec, registries::Vector{RegistryInstance})
             push!(entry_hashes, (string(reg.uuid, "/", uuid), registry_entry_hash(reg, entry)))
 
             info = entry_info(reg, entry)
-            for table in (info.deps, info.weak_deps)
-                for (_, deps) in table
-                    # Older Pkgs map names to UUIDs; Pkg 1.13 has a set of UUIDs.
-                    for dep_uuid in (deps isa AbstractSet ? deps : values(deps))
-                        if dep_uuid != JULIA_UUID && dep_uuid ∉ seen
-                            push!(seen, dep_uuid)
-                            push!(frontier, dep_uuid)
-                        end
+            for (_, deps) in info.deps
+                # Older Pkgs map names to UUIDs; Pkg 1.13 has a set of UUIDs.
+                for dep_uuid in (deps isa AbstractSet ? deps : values(deps))
+                    if dep_uuid != JULIA_UUID && dep_uuid ∉ seen
+                        push!(seen, dep_uuid)
+                        push!(frontier, dep_uuid)
                     end
                 end
             end

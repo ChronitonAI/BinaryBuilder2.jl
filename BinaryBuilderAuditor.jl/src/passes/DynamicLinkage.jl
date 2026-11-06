@@ -1,20 +1,10 @@
 using BinaryBuilderProducts, JLLGenerator
 
-function resolve_dynamic_links!(scan::ScanResult,
-                                pass_results::Dict{String,Vector{PassResult}},
-                                dep_libs::Dict{Symbol,Vector{JLLLibraryProduct}})
-    # We need to generate a graph showing which libraries are needed by the
-    # `library_products` in our `scan`.
-    dep_soname_map = Dict{String,Tuple{Symbol,Symbol}}()
-    for (jll_name, libs) in dep_libs
-        for lib in libs
-            dep_soname_map[basename(lib.soname)] = (Symbol(string(jll_name, "_jll")), lib.varname)
-        end
-    end
+function resolve_dynamic_links!(result::AuditResult, info::AuditInfo)
+    scan, pass_results = result.scan, result.pass_results
 
     # Iterate over our own library products, get list of dependencies,
-    # resolve each dep to its matching value in `soname_map`
-    jll_lib_products = JLLLibraryProduct[]
+    # resolve each dep to the library providing it, in a dependency or in this JLL
     for (rel_path, lib) in scan.library_products
         local lib_soname, lib_deps
 
@@ -57,8 +47,10 @@ function resolve_dynamic_links!(scan::ScanResult,
 
             # First, is this a library from a dependency?
             local jll_name, lib_varname
-            if haskey(dep_soname_map, lib_dep_soname)
-                jll_name, lib_varname = dep_soname_map[lib_dep_soname]
+            if haskey(info.sonames, lib_dep_soname)
+                dep_lib = info.sonames[lib_dep_soname]
+                jll_name = dep_lib.jll_name
+                lib_varname = dep_lib.varname
 
             # If not, does it come from our current JLL?
             else
@@ -67,7 +59,7 @@ function resolve_dynamic_links!(scan::ScanResult,
                 # compiled `libbar.so` to link against `libfoo.so`) then we need to update
                 # its linkage:
                 if haskey(scan.soname_forwards, lib_dep_soname)
-                    update_linkage!(scan, pass_results, rel_path, lib_dep_soname => scan.soname_forwards[lib_dep_soname])
+                    update_linkage!(result, rel_path, lib_dep_soname => scan.soname_forwards[lib_dep_soname])
                     lib_dep_soname = scan.soname_forwards[lib_dep_soname]
                 end
 
@@ -97,7 +89,7 @@ function resolve_dynamic_links!(scan::ScanResult,
             push!(jll_deps, JLLLibraryDep(jll_name, lib_varname))
         end
 
-        push!(jll_lib_products, JLLLibraryProduct(
+        push!(result.jll_lib_products, JLLLibraryProduct(
             lib.varname,
             rel_path,
             jll_deps,
@@ -108,30 +100,45 @@ function resolve_dynamic_links!(scan::ScanResult,
         ))
     end
 
-    # These returned products have all of their dependencies resolved as
-    # JLLLibraryDep objects, either pointing at other libraries wtihin this
-    # JLL, or to libraries from other JLLs.
-    sort!(jll_lib_products; by=jll->jll.varname)
-    return jll_lib_products
+    # These products have all of their dependencies resolved as JLLLibraryDep
+    # objects, either pointing at other libraries within this JLL, or to
+    # libraries from other JLLs.
+    sort!(result.jll_lib_products; by=jll->jll.varname)
+
+    return result
 end
 
-function update_linkage!(scan::ScanResult, pass_results::Dict{String,Vector{PassResult}},
-                         rel_path::AbstractString,
+function update_linkage!(result::AuditResult, rel_path::AbstractString,
                          (old_soname, new_soname)::Pair{<:AbstractString,<:AbstractString})
+    scan, pass_results = result.scan, result.pass_results
     if Sys.iswindows(scan.platform)
         return
     end
 
     abs_path = abspath(scan, rel_path)
     if Sys.isapple(scan.platform)
-        @warn("TODO: Do something with `install_name_tool` here")
+        # `install_name_tool -change` only matches the full install name (e.g.
+        # `@rpath/libfoo.dylib`), and silently does nothing otherwise, so find
+        # the full name and keep its directory when swapping in the new name.
+        oh = scan.binary_objects[rel_path]
+        old_soname = only(path(dl) for dl in DynamicLinks(oh) if basename(path(dl)) == old_soname)
+        if dirname(old_soname) != ""
+            new_soname = string(dirname(old_soname), "/", new_soname)
+        end
+    end
+
+    # The fact that these two commandlines serendipitously aligned their arguments made my day.
+    if Sys.isapple(scan.platform)
+        cmd = install_name_tool(scan, `-change $(old_soname) $(new_soname) $(abs_path)`)
     else
         cmd = patchelf(scan, `--replace-needed $(old_soname) $(new_soname) $(abs_path)`)
     end
 
-    proc, output = capture_output(cmd)
+    proc, output = with_writable(abs_path) do
+        capture_output(cmd)
+    end
     if !success(proc)
-        push_result!(pass_results, "rpaths_consistent!", :fail, rel_path, "Failed to set RPATH '$(rpath_str)': $(output)")
+        push_result!(pass_results, "update_linkage!", :fail, rel_path, "Failed to update linkage '$(old_soname)' -> '$(new_soname)': $(output)")
     else
         push_result!(pass_results, "update_linkage!", :success, rel_path, "Updating linkage '$(old_soname)' -> '$(new_soname)'")
     end
@@ -140,39 +147,57 @@ function update_linkage!(scan::ScanResult, pass_results::Dict{String,Vector{Pass
     refresh!(scan, rel_path)
 end
 
-function rpaths_consistent!(scan::ScanResult,
-                            pass_results::Dict{String,Vector{PassResult}},
-                            dep_libs::Dict{Symbol,Vector{JLLLibraryProduct}})
+function rpaths_consistent!(result::AuditResult, info::AuditInfo)
+    scan, pass_results = result.scan, result.pass_results
     # Windows doesn't do RPATHs, *sob*
     if Sys.iswindows(scan.platform)
         return
     end
 
-    # Augment `scan.soname_locator` with information from `dep_libs`:
+    # Augment `scan.soname_locator` with the dependencies' libraries
     soname_locator = copy(scan.soname_locator)
-    for (_, libs) in dep_libs
-        for lib in libs
-            soname_locator[basename(lib.soname)] = lib.path
-        end
+    for (soname, dep_lib) in info.sonames
+        soname_locator[soname] = dep_lib.path
     end
 
     # For each binary object, we need to build a list of the relative paths
     # from it to its dependencies, then ensure that all of those paths are
-    # present in the RPATHs of that binary object
-    for (rel_path, oh) in scan.binary_objects
-        dep_relpaths = Set{String}()
-        # ObjectFile cannot read every ELF file a build installs (seen with binutils'
-        # outputs); report it rather than failing the whole audit.
-        dynamic = try
-            isdynamic(oh)
+    # present in the RPATHs of that binary object.
+    #
+    # A file installed under several names (hard links, e.g. binutils' `bin/ld` and
+    # `bin/ld.bfd`) is one object on disk: setting the RPATH through one name changes
+    # the file behind the others, and invalidates their `ObjectHandle`s.  So we read
+    # each such file once, give it the RPATHs that each of its names needs (they can
+    # differ, as they are relative to the containing directory), and set them on all
+    # of its names.
+    files = Dict{Tuple{UInt64,UInt64},Vector{String}}()
+    for rel_path in keys(scan.binary_objects)
+        st = scan.files[rel_path]
+        push!(get!(Vector{String}, files, (st.device, st.inode)), rel_path)
+    end
+    for names in sort!(sort!.(collect(values(files))); by=first)
+        rel_path = first(names)
+        oh = scan.binary_objects[rel_path]
+
+        local dynamic, dep_sonames, obj_rpaths
+        try
+            dynamic = isdynamic(oh)
+            if dynamic
+                dep_sonames = [basename(path(dl)) for dl in DynamicLinks(oh)]
+                obj_rpaths = rpaths(RPath(oh))
+            end
         catch e
+            # Don't fail the whole audit on an object that we cannot read
             push_result!(pass_results, "rpaths_consistent!", :warn, rel_path, "Unable to read the object: $(sprint(showerror, e))")
             continue
         end
         if !dynamic
             continue
         end
-        for soname in [basename(path(dl)) for dl in DynamicLinks(oh)]
+
+        # Resolve each dependency to the directory that holds it
+        dep_dirs = String[]
+        for soname in dep_sonames
             # Don't try to insert RPATHs for system libraries
             if is_system_library(soname, scan.platform)
                 continue
@@ -185,57 +210,72 @@ function rpaths_consistent!(scan::ScanResult,
                 push_result!(pass_results, "rpaths_consistent!", :fail, rel_path, "Unable to resolve dependency '$(soname)'")
                 continue
             end
-            push!(dep_relpaths, relpath(dirname(soname_locator[soname]), dirname(rel_path)))
+            push!(dep_dirs, dirname(soname_locator[soname]))
         end
-
-        # Read RPATHs of this binary object
-        obj_rpaths = rpaths(RPath(oh))
 
         # Normalize the RPATHs, forcing them to be unique, and relative
         # to the originating object, (append all of our auto-detected RPATHs
         # onto the end of the RPATHs that already exist in the object)
-        all_rpaths = String[String(x) for x in vcat(obj_rpaths, collect(dep_relpaths))]
-        all_rpaths = normalize_rpaths(all_rpaths, scan.platform, scan.prefix, rel_path)
-
-        function run_and_log(cmd::Cmd, fatal::Bool, operation::String)
-            proc, output = capture_output(cmd)
-            if success(proc)
-                push_result!(pass_results, "rpaths_consistent!", :success, rel_path, operation)
-            else
-                push_result!(pass_results, "rpaths_consistent!", fatal ? :fail : :warn, rel_path, "Failed to $(operation): $(output)")
-            end
+        all_rpaths = String[]
+        for name in names
+            dep_relpaths = unique([relpath(d, dirname(name)) for d in dep_dirs])
+            name_rpaths = String[String(x) for x in vcat(obj_rpaths, dep_relpaths)]
+            append!(all_rpaths, normalize_rpaths(name_rpaths, scan.platform, scan.prefix, name))
         end
+        unique!(all_rpaths)
 
-        # Now, add them into the actual object
-        abs_path = abspath(scan, rel_path)
         rpath_str = join(all_rpaths, ':')
-        with_writable(abs_path) do
-            if Sys.isapple(scan.platform)
-                # Remove all rpaths from the object:
-                for rpath in obj_rpaths
-                    run_and_log(
-                        install_name_tool(scan, `-delete_rpath $(rpath) $(abs_path)`),
-                        false,
-                        "Delete RPATH '$(rpath)'",
-                    )
+        for name in names
+            function run_and_log(cmd::Cmd, fatal::Bool, operation::String)
+                proc, output = capture_output(cmd)
+                if success(proc)
+                    push_result!(pass_results, "rpaths_consistent!", :success, name, operation)
+                else
+                    push_result!(pass_results, "rpaths_consistent!", fatal ? :fail : :warn, name, "Failed to $(operation): $(output)")
                 end
+            end
 
-                # Build up our new rpath:
-                for rpath in all_rpaths
+            # Now, add them into the actual object
+            abs_path = abspath(scan, name)
+            with_writable(abs_path) do
+                if Sys.isapple(scan.platform)
+                    # An earlier name may already have changed this file's RPATHs (or,
+                    # if the tool replaced the file, not), so read them afresh.
+                    current_rpaths = obj_rpaths
+                    if name != rel_path
+                        name_oh = get_object_handle(abs_path, scan.platform)
+                        current_rpaths = name_oh === nothing ? String[] : rpaths(RPath(name_oh))
+                    end
+
+                    # Remove all rpaths from the object:
+                    for rpath in current_rpaths
+                        run_and_log(
+                            install_name_tool(scan, `-delete_rpath $(rpath) $(abs_path)`),
+                            false,
+                            "Delete RPATH '$(rpath)'",
+                        )
+                    end
+
+                    # Build up our new rpath:
+                    for rpath in all_rpaths
+                        run_and_log(
+                            install_name_tool(scan, `-add_rpath $(rpath) $(abs_path)`),
+                            true,
+                            "Add RPATH '$(rpath)'",
+                        )
+                    end
+                else
                     run_and_log(
-                        install_name_tool(scan, `-add_rpath $(rpath) $(abs_path)`),
+                        patchelf(scan, `--set-rpath $(rpath_str) $(abs_path)`),
                         true,
-                        "Add RPATH '$(rpath)'",
+                        "Set RPATH '$(rpath_str)'",
                     )
                 end
-            else
-                run_and_log(
-                    patchelf(scan, `--set-rpath $(rpath_str) $(abs_path)`),
-                    true,
-                    "Set RPATH '$(rpath_str)'",
-                )
             end
         end
+
+        # The file changed underneath our handles; re-read them
+        refresh!(scan, rel_path)
     end
 end
 

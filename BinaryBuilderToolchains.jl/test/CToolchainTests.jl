@@ -223,6 +223,11 @@ ENV["TESTSUITE_OUTPUT_DIR"] = mktempdir(;cleanup=false)
             for jll in sanitized.deps
                 @test jll.exempt_from_strict_tags == (jll.package.name == "LinuxKernelHeaders_jll")
             end
+            if !isdefined(Base.BinaryPlatforms, :strict_presence_tags)
+                # This Julia's platform matching would pick uninstrumented artifacts
+                @test_throws r"needs a Julia whose platform matching implements strict tags" prepare(sanitized.deps)
+                continue
+            end
             # No sanitized runtimes have been built, so the toolchain cannot be set up...
             @test_throws r"_jll has no artifact for .*sanitize\+memory" prepare(sanitized.deps)
             # ... but the headers resolve as for the untagged target
@@ -261,6 +266,8 @@ ENV["TESTSUITE_OUTPUT_DIR"] = mktempdir(;cleanup=false)
             pick(platform) = only(filter(j -> j.package.name == "LinuxKernelHeaders_jll",
                                          BinaryBuilderToolchains.use_toolchain_universe!(CToolchain(platform; use_ccache=false).deps, universe)))
             @test pick(plain_cp).package.repo.source == dev_dir
+            # What the JLL requests (and so its `spec_hash()`) changes along with it
+            @test pick(plain_cp).spec.repo.source == dev_dir
             # No artifact for this one
             other = CrossPlatform(BBHostPlatform() => Platform(arch(HostPlatform()) == "x86_64" ? "aarch64" : "x86_64", "linux"))
             @test startswith(pick(other).package.repo.source, "https://")

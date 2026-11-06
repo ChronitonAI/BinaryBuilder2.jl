@@ -33,8 +33,56 @@ function registries_to_download(registries::Vector{RegistrySpec}, depot_path::St
     end
 end
 
+"""
+    download_registry_snapshot!(reg::RegistrySpec, tree_hash::String, depot_path::String)
+
+Download the snapshot of `reg` whose git tree hash is `tree_hash` from the package
+server into `depot_path`, the same way that `Pkg` stores the registries it downloads
+(a tarball next to a `.toml` that records its tree hash).  Does nothing if `depot_path`
+already holds that snapshot.
+"""
+function download_registry_snapshot!(reg::RegistrySpec, tree_hash::String, depot_path::String;
+                                     verbose::Bool = false)
+    regdir = joinpath(depot_path, "registries")
+    toml_path = joinpath(regdir, string(reg.name, ".toml"))
+    if isfile(toml_path) && get(TOML.parsefile(toml_path), "git-tree-sha1", nothing) == tree_hash
+        return
+    end
+
+    server = Pkg.pkg_server()
+    if server === nothing || reg.uuid === nothing
+        throw(ArgumentError("Cannot download snapshot $(tree_hash) of registry '$(reg.name)' without a package server"))
+    end
+    url = "$(server)/registry/$(reg.uuid)/$(tree_hash)"
+    mkpath(regdir)
+    tarball_name = string(reg.name, ".tar.gz")
+    mktempdir(regdir) do tmp
+        tmp_tarball = joinpath(tmp, tarball_name)
+        try
+            Pkg.PlatformEngines.download_verify(url, nothing, tmp_tarball; quiet_download=!verbose)
+        catch e
+            throw(ArgumentError("Unable to download snapshot $(tree_hash) of registry '$(reg.name)' from $(url): $(sprint(showerror, e))"))
+        end
+        if !Pkg.PlatformEngines.verify_archive_tree_hash(tmp_tarball, Base.SHA1(tree_hash))
+            throw(ArgumentError("Snapshot of registry '$(reg.name)' downloaded from $(url) does not match its tree hash"))
+        end
+
+        # Get rid of any unpacked copy of this registry, so that it can't shadow our snapshot.
+        rm(joinpath(regdir, reg.name); force=true, recursive=true)
+        mv(tmp_tarball, joinpath(regdir, tarball_name); force=true)
+        open(toml_path; write=true) do io
+            TOML.print(io, Dict(
+                "uuid" => string(reg.uuid),
+                "git-tree-sha1" => tree_hash,
+                "path" => tarball_name,
+            ))
+        end
+    end
+end
+
 function update_registries!(registries::Vector{RegistrySpec},
                             depot_path::String;
+                            registry_hashes::Dict{String,String} = Dict{String,String}(),
                             verbose::Bool = false)
     # For each registry, update it and then check it out into the given `depot_path`
     # if it does not already exist there.
@@ -53,7 +101,23 @@ function update_registries!(registries::Vector{RegistrySpec},
     # is no longer a threat to our caches either way: `spec_hash(::JLLSource)` hashes only
     # the slice of the registries that the JLL in question resolves against, so unrelated
     # `General` commits don't invalidate anything.
-    to_download = registries_to_download(registries, depot_path)
+    #
+    # Registries named in `registry_hashes` are instead pinned to that exact snapshot, so
+    # that separate sessions (e.g. the jobs of a CI pipeline) all hash and resolve against
+    # the same registries.  The slice of `General` that `spec_hash(::JLLSource)` covers is
+    # small, but not empty: a session that picked up a new version of something within it
+    # would compute different build hashes than one that didn't.
+    unknown_pins = setdiff(keys(registry_hashes), [reg.name for reg in registries])
+    if !isempty(unknown_pins)
+        throw(ArgumentError("Registry hashes given for unknown registries: $(join(unknown_pins, ", "))"))
+    end
+    for reg in registries
+        if haskey(registry_hashes, reg.name)
+            download_registry_snapshot!(reg, registry_hashes[reg.name], depot_path; verbose)
+        end
+    end
+
+    to_download = registries_to_download(filter(reg -> !haskey(registry_hashes, reg.name), registries), depot_path)
     if !isempty(to_download)
         Pkg.Registry.download_registries(verbose ? stdout : devnull, to_download, depot_path)
         for reg in to_download
@@ -107,28 +171,44 @@ struct Universe
     depot_path::String
     registries::Vector{RegistrySpec}
     registry_instances::Vector{RegistryInstance}
+
+    # Registry snapshots (by name) that we are pinned to; see `update_registries!()`.
+    registry_hashes::Dict{String,String}
     persistent::Bool
 
     # `deploy_org` here refers to a Github organization/user to deploy to.
     # If this is specified, `Foo_jll` will be deployed to `https://github.com/$(deploy_org)/Foo_jll.jl`
-    # and the registry changes will be pushed to `https://github.com/$(deploy_org)/General`
+    # and, unless `register_url` is given, the registry changes will be pushed to
+    # `https://github.com/$(deploy_org)/General`
     deploy_org::Union{Nothing,String}
 
-    # This allows overriding which registry gets pushed to; this is most useful
-    # for Yggdrasil, where we usually run with `deploy_org = "JuliaBinaryWrappers"`
-    # but `registry_url = "https://github.com/JuliaRegistries/General"`.
-    registry_url::Union{Nothing,String}
+    # If this is specified, the registry changes are pushed as a branch directly to this
+    # registry (e.g. `https://github.com/JuliaRegistries/General`) and a pull request is
+    # opened against it.  It must be the URL of one of `registries` (or of a fork of it,
+    # such as `https://github.com/$(deploy_org)/General`), which is then the one we
+    # register into.  On Yggdrasil, we run with `deploy_org = "JuliaBinaryWrappers"` but
+    # `register_url = "https://github.com/JuliaRegistries/General"`.
+    register_url::Union{Nothing,String}
 
     function Universe(name::Union{Nothing,AbstractString} = nothing;
                       depot_path::Union{Nothing,AbstractString} = nothing,
                       deploy_org::Union{Nothing,AbstractString} = nothing,
                       registries::Vector{RegistrySpec} = copy(Pkg.Registry.DEFAULT_REGISTRIES),
-                      registry_url::Union{Nothing,AbstractString} = nothing,
+                      register_url::Union{Nothing,AbstractString} = nothing,
+                      registry_hashes::AbstractDict{<:AbstractString,<:AbstractString} = Dict{String,String}(),
                       persistent::Bool = false,
                       kwargs...)
         @ensure_all_kwargs_consumed_header()
         if isempty(registries)
             throw(ArgumentError("Must pass at least one registry to `Universe()`!"))
+        end
+        if register_url !== nothing
+            if deploy_org === nothing
+                throw(ArgumentError("Cannot register with a local deployment!"))
+            end
+            if find_registry(registries, register_url) === nothing
+                throw(ArgumentError("Cannot register into '$(register_url)', as it is not (a fork of) one of the universe's registries: $(join([reg.url for reg in registries], ", "))"))
+            end
         end
 
         # If `depot_path` is not given, default to the `universes_dir()`.
@@ -145,8 +225,9 @@ struct Universe
         # We always attempt to share the `artifacts` and `packages` directories of our universe with the `jllsource_depot`.
         BinaryBuilderSources.make_thin_depot!(depot_path)
 
-        # Ensure the upstream registries are up to date
-        registry_instances = update_registries!(registries, depot_path)
+        # Ensure the upstream registries are up to date (or at the snapshots we're pinned to)
+        registry_hashes = Dict{String,String}(string(k) => string(v) for (k, v) in registry_hashes)
+        registry_instances = update_registries!(registries, depot_path; registry_hashes)
 
         # Create our own, empty registry we'll register things into.
         local_reg_spec = create_local_registry(depot_path)
@@ -157,9 +238,22 @@ struct Universe
             # Authenticate to GitHub, then ensure that we are either deploying to our
             # user, or an organization we are a part of
             if allow_github_authentication[]
-                ensure_gh_authenticated()
-                if deploy_org != gh_user() && deploy_org ∉ gh_orgs()
+                with_gh_token(ensure_gh_authenticated, deploy_org)
+                if !gh_can_deploy_to(deploy_org)
+                    @debug("Github Auth Failure", deploy_org, gh_user())
                     throw(ArgumentError("deploy target '$(deploy_org)' not a user/organization we have access to!"))
+                end
+
+                # The registry may be pushed directly to `register_url` rather than to a fork
+                # in `deploy_org`, possibly with its own token from the `access_tokens` preference.
+                # A registry within `deploy_org` may not exist yet, as we fork it on first use.
+                reg_repo = register_url === nothing ? nothing : gh_repo_name(register_url)
+                if reg_repo !== nothing && lowercase(first(split(reg_repo, "/"))) != lowercase(deploy_org)
+                    with_gh_token(ensure_gh_authenticated, reg_repo)
+                    if !gh_push_access(reg_repo)
+                        @debug("Github Auth Failure", reg_repo, gh_user())
+                        throw(ArgumentError("registry '$(reg_repo)' not a repository we can push to!"))
+                    end
                 end
             end
         end
@@ -171,9 +265,10 @@ struct Universe
             depot_path,
             registries,
             registry_instances,
+            registry_hashes,
             persistent,
             deploy_org,
-            string(registry_url),
+            register_url === nothing ? nothing : string(register_url),
         )
         prune!(uni)
         try
@@ -199,6 +294,21 @@ function cleanup(uni::Universe; silent::Bool = false)
         end
         rm(uni.depot_path; force=true, recursive=true)
     end
+end
+
+"""
+    registry_hashes(u::Universe)
+
+Return the git tree hashes of the snapshots of the (upstream, tarball) registries in
+`u`, keyed by registry name.  Passing these as `registry_hashes` to another `Universe`
+(or as `--registry-hashes` to `build_tarballs.jl`) makes it resolve against the very
+same registries, even if they have been updated in the meantime.
+"""
+function registry_hashes(u::Universe)
+    return Dict{String,String}(
+        reg.name => bytes2hex(reg.tree_info.bytes)
+        for reg in u.registry_instances if reg.tree_info !== nothing
+    )
 end
 
 function Base.show(io::IO, uni::Universe)
@@ -495,7 +605,7 @@ and clears the environment of the dev'ed JLLs.
 function reset_timeline!(u::Universe)
     # Update registries to the latest, but skip the first one since
     # it's our local registry and it errors out if we try to update it.
-    u.registry_instances[2:end] .= update_registries!(u.registries[2:end], u.depot_path)
+    u.registry_instances[2:end] .= update_registries!(u.registries[2:end], u.depot_path; u.registry_hashes)
 
     # Clear out our local registry and recreate it
     rm(joinpath(u.depot_path, "registries", "BB2LocalRegistry"); force=true, recursive=true)
@@ -658,12 +768,21 @@ function deploy_jll(jll_path::String,
             url="https://github.com/$(deploy_org)/$(jll_name)_jll.jl/releases/$(tag_name)",
         )
     end
-    create_cmd = `$(gh()) release create --repo $(deploy_org)/$(jll_name)_jll.jl $(tag_name) --title $(tag_name) --notes "" --verify-tag $(readdir(binaries_dir; join=true))`
-    if !success(create_cmd)
-        run(`$(gh()) release delete --yes --repo $(deploy_org)/$(jll_name)_jll.jl $(tag_name)`)
-        run(create_cmd)
+    with_gh_token(deploy_org, "$(jll_name)_jll.jl") do
+        with_gh() do gh
+            create_cmd = `$(gh) release create --repo $(deploy_org)/$(jll_name)_jll.jl $(tag_name) --title $(tag_name) --notes "" --verify-tag $(readdir(binaries_dir; join=true))`
+            if !success(create_cmd)
+                run(`$(gh) release delete --yes --repo $(deploy_org)/$(jll_name)_jll.jl $(tag_name)`)
+                run(create_cmd)
+            end
+        end
     end
 end
+
+# The shared bare clone of a JLL's repository that `init_jll_repo()` (re)creates.
+# Anyone using it must hold `with_download_lock()` on this path, as it is deleted
+# and re-cloned by every `register_jll!()`.
+jll_bare_repo_path(jll_name::String) = source_download_cache("$(jll_name)_jll")
 
 function init_jll_repo(u::Universe, jll_name::String)
     # There are four possible control flows here:
@@ -678,7 +797,7 @@ function init_jll_repo(u::Universe, jll_name::String)
 
     # Note that we search for the "upstream" repo URL here only in our non-BB2Local registry
     jll_repo_url = get_package_repo(u, "$(jll_name)_jll"; registries=u.registry_instances[2:end])
-    jll_bare_repo = source_download_cache("$(jll_name)_jll")
+    jll_bare_repo = jll_bare_repo_path(jll_name)
 
     # This is the case if this was previously registered within this
     # universe when it did not exist previously.  In this case, nuke it.
@@ -732,7 +851,9 @@ function get_registry_clone(uni::Universe, reg::RegistrySpec, branch_name::Union
     reg_clone_path = joinpath(cache_dir, reg.name)
     # Only hit the network if we haven't fetched this registry this session
     if force || reg.uuid ∉ fetched_registries
-        clone!(reg.url, reg_clone_path)
+        BinaryBuilderSources.with_download_lock(reg_clone_path) do
+            clone!(reg.url, reg_clone_path)
+        end
         push!(fetched_registries, reg.uuid)
     end
 
@@ -747,6 +868,48 @@ function get_registry_clone(uni::Universe, reg::RegistrySpec, branch_name::Union
     end
 
     return reg_checkout_path
+end
+
+# Find the registry within `registries` that lives at the GitHub repository `url`.
+# If there is none, `url` may be a fork (e.g. `deploy_org/General`), so we fall
+# back to finding the registry with the same name as the repository.
+function find_registry(registries::Vector{RegistrySpec}, url::AbstractString)
+    repo = lowercase(gh_repo_name(url))
+    for reg in registries
+        if reg.url === nothing
+            continue
+        end
+        reg_repo = try
+            gh_repo_name(reg.url)
+        catch
+            continue
+        end
+        if lowercase(reg_repo) == repo
+            return reg
+        end
+    end
+
+    repo_name = last(split(repo, "/"))
+    for reg in registries
+        if lowercase(reg.name) == repo_name
+            return reg
+        end
+    end
+    return nothing
+end
+
+"""
+    target_registry(u::Universe)
+
+Return the upstream registry that deployed JLLs get registered into; this is the
+registry at `u.register_url` if given, otherwise the first upstream registry.
+"""
+function target_registry(u::Universe)
+    upstream_registries = u.registries[2:end]
+    if u.register_url !== nothing
+        return find_registry(upstream_registries, u.register_url)
+    end
+    return first(upstream_registries)
 end
 
 function add_dot_git(url::String)
@@ -768,27 +931,26 @@ function register_jll!(u::Universe, jll::JLLInfo; skip_artifact_export::Bool = f
     if verbose
         @info("Initializing JLL repository", name=jll.name)
     end
-    jll_repo_url, jll_bare_repo = init_jll_repo(u, jll.name)
-
     jll_path = joinpath(u.depot_path, "dev", "$(jll.name)_jll")
     export_dir = joinpath(u.depot_path, "tarballs", string(jll.name, "-v", jll.version))
     rm(jll_path; force=true, recursive=true)
     rm(export_dir; force=true, recursive=true)
     mkpath(export_dir)
 
-    if u.name !== nothing
-        uni_branch_name = "bb2/$(u.name)"
-        if isbranch(jll_bare_repo, uni_branch_name)
+    uni_branch_name = u.name !== nothing ? "bb2/$(u.name)" : nothing
+
+    # The bare repo is shared by every process registering this JLL (e.g. one per platform),
+    # so hold its lock until we have our own checkout of it.
+    jll_repo_url = BinaryBuilderSources.with_download_lock(jll_bare_repo_path(jll.name)) do
+        repo_url, jll_bare_repo = init_jll_repo(u, jll.name)
+        if uni_branch_name !== nothing && isbranch(jll_bare_repo, uni_branch_name)
             src_branch = uni_branch_name
         else
             src_branch = head_branch(jll_bare_repo)
         end
-    else
-        uni_branch_name = nothing
-        src_branch = head_branch(jll_bare_repo)
+        checkout!(jll_bare_repo, jll_path, src_branch; verbose)
+        return repo_url
     end
-
-    checkout!(jll_bare_repo, jll_path, src_branch; verbose)
     if uni_branch_name !== nothing
         branch!(jll_path, uni_branch_name)
     end
@@ -814,9 +976,10 @@ function register_jll!(u::Universe, jll::JLLInfo; skip_artifact_export::Bool = f
 
     in_universe(u) do env
         # Next, add that JLL to the universe's environment
-        # JLLs that are also in the sysimage (CompilerSupportLibraries_jll, Zlib_jll, ...)
-        # can only be developed with this check off; the universe's environment is never
-        # loaded into this process, so the sysimage's copies don't matter here.
+        # Pkg refuses to develop a package that is in the running Julia's sysimage
+        # (e.g. `CompilerSupportLibraries_jll`, `OpenBLAS_jll`) unless this check is
+        # off.  The universe's environment is never loaded into this process, so the
+        # sysimage's copy does not matter here.
         respect = Pkg.RESPECT_SYSIMAGE_VERSIONS[]
         Pkg.respect_sysimage_versions(false)
         try
@@ -850,8 +1013,15 @@ function register_jll!(u::Universe, jll::JLLInfo; skip_artifact_export::Bool = f
     if u.deploy_org !== nothing
         # If we're deploying, we actually need to re-register into our target registry (usually `General`)
         # In order to do that, we also need to make a clone of General, so let's do that here:
-        target_reg = first(u.registries[2:end])
-        target_reg_path = get_registry_clone(u, target_reg, uni_branch_name)
+        target_reg = target_registry(u)
+
+        # A pull request needs a branch of its own, so if we have no universe name
+        # to name the branch after, we name it after the (unique) universe depot instead.
+        reg_branch_name = uni_branch_name
+        if reg_branch_name === nothing && u.register_url !== nothing
+            reg_branch_name = "bb2/$(basename(u.depot_path))"
+        end
+        target_reg_path = get_registry_clone(u, target_reg, reg_branch_name)
 
         with_logger(MinLevelLogger(current_logger(), verbose ? Logging.Info : Logging.Error)) do
             LocalRegistry.register(
@@ -859,18 +1029,42 @@ function register_jll!(u::Universe, jll::JLLInfo; skip_artifact_export::Bool = f
                 registry=target_reg_path,
                 commit=true,
                 push=false,
-                repo=jll_repo_url,
+                repo=add_dot_git(jll_repo_url),
                 # When iterating, this is pretty useful.
                 ignore_reregistration=true,
             )
         end
 
-        reg_org_repo = "$(u.deploy_org)/$(target_reg.name)"
-        if !gh_repo_exists(reg_org_repo)
-            gh_fork(reg.url, u.deploy_org)
+        # Push directly to the registry we're registering into (e.g. `JuliaRegistries/General`),
+        # or, if we're not registering, to our fork of the registry within `deploy_org`.
+        reg_repo = gh_repo_name(something(u.register_url, "$(u.deploy_org)/$(target_reg.name)"))
+        if !gh_repo_exists(reg_repo)
+            gh_fork(target_reg.url, String(first(split(reg_repo, "/"))))
         end
-        remote_url!(target_reg_path, u.deploy_org, "https://github.com/$(reg_org_repo)")
+        remote_url!(target_reg_path, u.deploy_org, "https://github.com/$(reg_repo)")
         push!(target_reg_path, u.deploy_org; force=true)
+
+        # Open a pull request from the branch we just pushed against the registry
+        if u.register_url !== nothing
+            pr_head = "$(first(split(reg_repo, "/"))):$(head_branch(target_reg_path))"
+            is_new_package = isempty(get_package_versions(u, "$(jll.name)_jll"; registries=u.registry_instances[2:end]))
+            pr_url = gh_open_pr(
+                reg_repo,
+                pr_head,
+                "New $(is_new_package ? "package" : "version"): $(jll.name)_jll v$(jll.version)",
+                """
+                Autogenerated JLL package registration
+
+                * Registering JLL package $(jll.name)_jll.jl
+                * Repository: $(jll_repo_url)
+                * Version: v$(jll.version)
+                * Commit: $(bytes2hex(only(log(jll_path; limit=1))))
+                """,
+            )
+            if verbose
+                @info("Registry pull request", pr_url)
+            end
+        end
     end
 end
 

@@ -84,7 +84,7 @@ struct BuildConfig
                 bytes2hex(bb_package_treehashes()["BinaryBuilder2"].hash),
                 script,
             ))
-            return string("BB2-", bytes2hex(hash)[1:4], "-metadir")
+            return string("BB2-", bytes2hex(hash), "-metadir")
         end
 
         # Dependencies for each target's prefix
@@ -307,13 +307,15 @@ function BinaryBuilderSources.spec_hash(config::BuildConfig; force_recompute::Bo
             println(hash_buffer, "  $(prefix) = $(spec_hash(deps; registries))")
 
             # For debugging build cache issues
-            # source_str(gs::GitSource) = "GitSource: $(gs.target)"
-            # source_str(ds::DirectorySource) = "DirectorySource: $(ds.target)"
-            # source_str(gs::GeneratedSource) = "GeneratedSource: $(gs.ds.target)"
-            # source_str(js::JLLSource) = "JLLSource $(js.package.name) $(js.target)"
-            # for dep in deps
-            #     println(hash_buffer, "    - $(source_str(dep)) $(spec_hash(dep))")
-            # end
+            source_str(gs::GitSource) = "GitSource: $(gs.target)"
+            source_str(ds::DirectorySource) = "DirectorySource: $(ds.target)"
+            source_str(gs::GeneratedSource) = "GeneratedSource: $(gs.ds.target)"
+            source_str(js::JLLSource) = "JLLSource $(js.package.name) $(js.target)"
+            source_str(as::ArchiveSource) = "ArchiveSource: $(source(as)) $(as.target)"
+            source_str(fs::FileSource) = "FileSource: $(source(fs)) $(fs.target)"
+            for dep in deps
+                println(hash_buffer, "    - $(source_str(dep)) $(spec_hash(dep; registries))")
+            end
         end
 
         # The JLLs the universe has built are resolved through its environment, so the
@@ -359,32 +361,56 @@ metadir_prefix() = "/workspace/metadir"
 # Helper function to better control when we download all our deps
 # Ideally, this would be paralellized somehow.
 @trace_function args=(src_name=config.src_name,) function prepare(config::BuildConfig; verbose::Bool = false)
+    for (prefix, deps) in config.source_trees
+        prepare_source_tree(config, prefix, deps; verbose)
+    end
+end
+
+"""
+    source_records(config::BuildConfig)
+
+The `JLLSourceRecord`s (URL and content hash) of the sources mounted in
+`/workspace/srcdir`.  These must already be `prepare()`'ed.
+"""
+function source_records(config::BuildConfig)
+    return JLLSourceRecord[JLLSourceRecord(s) for s in config.source_trees[source_prefix()]]
+end
+
+"""
+    prepare_source_tree(config::BuildConfig, prefix::String, deps = config.source_trees[prefix])
+
+`prepare()` (download, clone, resolve, ...) the sources of one of `config`'s source
+trees.  `prepare(config)` does this for every tree before a build; packaging a build
+that came out of the build cache uses it to fetch just the `/workspace/srcdir` sources,
+whose `content_hash()` gets recorded in the JLL.
+"""
+function prepare_source_tree(config::BuildConfig, prefix::String,
+                             deps::Vector{<:AbstractSource} = config.source_trees[prefix];
+                             verbose::Bool = false)
     universe = config.meta.universe
     depot = depot_path(universe)
     registries = Pkg.Registry.reachable_registries(; depots=[depot])
     disable_jll_cache = "jll" ∈ config.meta.disabled_caches
-    for (prefix, deps) in config.source_trees
-        # We install different source trees in different environments.
-        with_trace(config, "bb2.prepare_source_tree"; timer_name=prefix, args=(prefix=prefix,)) do
-            mktempdir() do project_dir
-                # We have some special magic to work here; oftentimes, when we perform
-                # multiple builds within the same universe, we do so because we want to
-                # make use of a previous build in a new one.  To effect this, we copy
-                # our universe's environment in to all of our source trees, so that
-                # if we build, e.g. `Zlib_jll`, we use that `Zlib_jll` for everything
-                # in the rest of the build.
-                cp(dirname(environment_path(universe)), project_dir; force=true)
-                # This verbose needs like a `verbose = verbose_level >= 2` or something
-                prepare(deps;
-                    verbose=false,
-                    force=disable_jll_cache,
-                    project_dir,
-                    registries,
-                    depot,
-                    fallback_depot=upstream_depot_path(universe),
-                    to=config.to,
-                )
-            end
+    # We install different source trees in different environments.
+    with_trace(config, "bb2.prepare_source_tree"; timer_name=prefix, args=(prefix=prefix,)) do
+        mktempdir() do project_dir
+            # We have some special magic to work here; oftentimes, when we perform
+            # multiple builds within the same universe, we do so because we want to
+            # make use of a previous build in a new one.  To effect this, we copy
+            # our universe's environment in to all of our source trees, so that
+            # if we build, e.g. `Zlib_jll`, we use that `Zlib_jll` for everything
+            # in the rest of the build.
+            cp(dirname(environment_path(universe)), project_dir; force=true)
+            # This verbose needs like a `verbose = verbose_level >= 2` or something
+            prepare(deps;
+                verbose=false,
+                force=disable_jll_cache,
+                project_dir,
+                registries,
+                depot,
+                fallback_depot=upstream_depot_path(universe),
+                to=config.to,
+            )
         end
     end
 end
@@ -558,6 +584,8 @@ end
     # Write build script out into a logfile
     build_log_io = IOBuffer()
     mounts = deploy(config; verbose)
+    # The sources are on disk now, so record them for the JLL (and the build cache)
+    srcs_records = source_records(config)
     sandbox_config, collector = sandbox_and_collector(
         build_log_io, config, mounts;
         verbose,
@@ -620,6 +648,7 @@ end
         log_artifact_hash,
         env,
         ccache_log_artifact_hash,
+        srcs_records,
     )
     meta.builds[config] = result
 

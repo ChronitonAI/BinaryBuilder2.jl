@@ -52,6 +52,7 @@ function CachedGeneratedSource(f::Function, name::String; target::String)
 end
 
 
+include("JLLPins.jl")
 include("WrapperUtils.jl")
 include("PathUtils.jl")
 include("toolchains/BinutilsToolchain.jl")
@@ -63,13 +64,14 @@ include("PkgUtils.jl")
 include("InteractiveUtils.jl")
 
 @setup_workload begin
+    native_linux = Platform(arch(BBHostPlatform()), "linux")
     targets = [
-        BBHostPlatform(),
+        native_linux,
         Platform("x86_64", "windows"),
         Platform("armv7l", "linux"; libc=:musl),
         Platform("aarch64", "macos"; os_version=v"20"),
     ]
-    platforms = [CrossPlatform(BBHostPlatform() => target) for target in targets]
+    platforms = [CrossPlatform(native_linux => target) for target in targets]
     @compile_workload begin
         for platform in platforms
             # try/catch when running on platforms other than the typical BB2 host platforms
