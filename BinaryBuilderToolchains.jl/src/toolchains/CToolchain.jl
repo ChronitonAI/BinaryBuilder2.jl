@@ -215,7 +215,7 @@ struct CToolchain <: AbstractToolchain
             extra_ldflags...,
             # The software ticks flags the wrappers add (`add_softticks_flags()`): bump the
             # version when they change, so that cached wrappers are regenerated.
-            rr_softticks(platform.target) === nothing ? "" : "softticks-wrappers-3",
+            rr_softticks(platform.target) === nothing ? "" : "softticks-wrappers-4",
         )
         cache_key = string(
             "CToolchain-",
@@ -922,6 +922,13 @@ function add_softticks_flags(io, toolchain, compiler::Symbol)
     else
         throw(ArgumentError("No software ticks plugin for compiler '$(compiler)'"))
     end
+    # ccache keys its cache on the toolchain's `cache_key()` (`compiler_check`), which
+    # does not cover the plugin's build: have it hash the plugin itself, or a rebuilt
+    # plugin keeps getting objects compiled with the previous one.
+    plugin_file = compiler == :gcc ? "softticks_gcc.so" : "softticks_llvm.so"
+    println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
+    println(io, "    export CCACHE_EXTRAFILES=\"$(softticks_lib)/$(plugin_file)\${CCACHE_EXTRAFILES:+:\${CCACHE_EXTRAFILES}}\"")
+    println(io, "fi")
     compile_flagmatch(io) do io
         println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
         append_flags(io, :PRE, [
