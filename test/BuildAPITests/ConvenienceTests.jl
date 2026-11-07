@@ -101,6 +101,21 @@ end
         @test any(isa.(target_toolchains, PlatformlessWrapper{CToolchain}))
         @test any(isa.(target_toolchains, PlatformlessWrapper{FortranToolchain}))
         @test any(isa.(host_toolchains, PlatformlessWrapper{FortranToolchain}))
+
+        # BinaryBuilder1's `lock_microarchitecture`, for the C and Fortran toolchains of both
+        locked(tcs) = [tc.kwargs[:lock_microarchitecture] for tc in tcs
+                       if isa(tc, Union{PlatformlessWrapper{CToolchain},PlatformlessWrapper{FortranToolchain}})]
+        target_toolchains, host_toolchains = BinaryBuilder2.Compat.compilers_to_toolchains([:c, :fortran])
+        @test locked(target_toolchains) == [true, true]
+        @test locked(host_toolchains) == [true, true]
+        target_toolchains, host_toolchains = BinaryBuilder2.Compat.compilers_to_toolchains([:c, :fortran]; lock_microarchitecture=false)
+        @test locked(target_toolchains) == [false, false]
+        @test locked(host_toolchains) == [false, false]
+        native_linux = Platform(arch(HostPlatform()), "linux")
+        for (pw, lock) in ((only(filter(t -> isa(t, PlatformlessWrapper{CToolchain}), target_toolchains)), false),
+                           (only(filter(t -> isa(t, PlatformlessWrapper{FortranToolchain}), target_toolchains)), false))
+            @test BinaryBuilder2.apply_platform(pw, CrossPlatform(native_linux => native_linux)).lock_microarchitecture == lock
+        end
     end
 
     @testset "FortranToolchain" begin

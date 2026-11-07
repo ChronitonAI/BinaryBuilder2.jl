@@ -29,7 +29,7 @@ function HostBuildDependency(name_or_pkgspec)
 end
 
 """
-    compilers_to_toolchains(compilers::Vector{Symbol})
+    compilers_to_toolchains(compilers::Vector{Symbol}; lock_microarchitecture::Bool = true)
 
 Map a BinaryBuilder1-style `compilers` list (e.g. `[:c]`) to a `(target_toolchains,
 host_toolchains)` tuple.  The host always receives `HostToolsToolchain()`.
@@ -37,18 +37,22 @@ host_toolchains)` tuple.  The host always receives `HostToolsToolchain()`.
 `:fortran` adds a `FortranToolchain()` (`gfortran`, `\$FC`), which BinaryBuilder1 has no
 compiler name for: there, `:c` comes with `gfortran`.  Here a recipe opts into Fortran
 with `compilers = [:c, :fortran]`.
+
+`lock_microarchitecture` is BinaryBuilder1's option of that name, for the C and Fortran
+toolchains of the target and the host alike: `false` lets the build pass its own `-march`
+(e.g. OpenBLAS's `DYNAMIC_ARCH` kernels, and its `getarch` with `-march=native`).
 """
-function compilers_to_toolchains(compilers::Vector{Symbol})
+function compilers_to_toolchains(compilers::Vector{Symbol}; lock_microarchitecture::Bool = true)
     target_toolchains = []
     host_toolchains = []
     for compiler in unique(compilers)
         if compiler == :c
             # BinaryBuilder1's `:c` compiler set always came with CMake as well
-            append!(target_toolchains, [CToolchain(), CMakeToolchain()])
-            append!(host_toolchains, [CToolchain(), CMakeToolchain()])
+            append!(target_toolchains, [CToolchain(; lock_microarchitecture), CMakeToolchain()])
+            append!(host_toolchains, [CToolchain(; lock_microarchitecture), CMakeToolchain()])
         elseif compiler == :fortran
-            push!(target_toolchains, FortranToolchain())
-            push!(host_toolchains, FortranToolchain())
+            push!(target_toolchains, FortranToolchain(; lock_microarchitecture))
+            push!(host_toolchains, FortranToolchain(; lock_microarchitecture))
         else
             throw(ArgumentError("BinaryBuilder1 compiler `:$(compiler)` is not yet supported by BinaryBuilder2"))
         end
@@ -58,7 +62,7 @@ function compilers_to_toolchains(compilers::Vector{Symbol})
 end
 
 # Map BinaryBuilder1 syntax to BB2 syntax
-function BinaryBuilder2.build_tarballs(ARGS::Vector{String}, src_name::String, src_version, sources, script, platforms, products, dependencies; julia_compat::String = "1.6", compilers::Vector{Symbol} = [:c], kwargs...)
+function BinaryBuilder2.build_tarballs(ARGS::Vector{String}, src_name::String, src_version, sources, script, platforms, products, dependencies; julia_compat::String = "1.6", compilers::Vector{Symbol} = [:c], lock_microarchitecture::Bool = true, kwargs...)
     # Separate out the dependencies into target dependencies and host dependencies
     target_dependencies = []
     target_build_time_dependencies = []
@@ -76,7 +80,7 @@ function BinaryBuilder2.build_tarballs(ARGS::Vector{String}, src_name::String, s
         end
     end
 
-    target_toolchains, host_toolchains = compilers_to_toolchains(compilers)
+    target_toolchains, host_toolchains = compilers_to_toolchains(compilers; lock_microarchitecture)
 
     return build_tarballs(;
         src_name,
