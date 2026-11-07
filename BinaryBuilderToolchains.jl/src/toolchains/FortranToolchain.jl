@@ -25,6 +25,12 @@ Keyword arguments:
 The wrappers do not use `ccache`, which cannot cache Fortran.  GCC 14's `libgfortran` is
 `libgfortran5`, the only `libgfortran_version` a target can ask for (see
 `expand_gfortran_versions()`).
+
+On a software ticks platform (`rr_softticks`), the wrappers load the software ticks plugin
+(`GCCSoftTicksPlugin_jll`, which the toolchain installs) into `gfortran` and define
+`__RR_SOFTTICKS__`, as the C toolchain's do (`add_softticks_flags()`); the wrapper's
+definition is the only one there, as the plugin defines the macro in the C family's
+preprocessor only.
 """
 struct FortranToolchain <: AbstractToolchain
     platform::CrossPlatform
@@ -106,6 +112,9 @@ struct FortranToolchain <: AbstractToolchain
                 wrapper_prefixes,
                 extra_fflags,
                 extra_ldflags,
+                # The software ticks flags the wrappers add (`add_softticks_flags()`): bump
+                # the version when they change, so that cached wrappers are regenerated.
+                rr_softticks(platform.target) === nothing ? "" : "softticks-fortran-wrappers-1",
             )))),
         )
 

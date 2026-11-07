@@ -63,7 +63,7 @@ ctoolchain_jlls(ct) = JLLSource[ct.binutils_toolchain.deps..., ct.deps...]
     # The GCC that a `FortranToolchain` installs is the one of the `CToolchain` next to it,
     # down to the JLL requests, so that the two merge in a prefix
     @testset "JLLs shared with the CToolchain" begin
-        for target in (HostPlatform(),
+        for target in (HostPlatform(), Platform("x86_64", "linux"; rr_softticks="1"),
                        Platform("aarch64", "linux"), Platform("x86_64", "windows"),
                        Platform("aarch64", "macos"), Platform("x86_64", "linux"; libc="musl"))
             cp = CrossPlatform(BBHostPlatform() => target)
@@ -90,7 +90,7 @@ ctoolchain_jlls(ct) = JLLSource[ct.binutils_toolchain.deps..., ct.deps...]
     end
 
     @testset "wrappers" begin
-        let target = HostPlatform()
+        for (target, softticks) in ((HostPlatform(), false), (Platform("x86_64", "linux"; rr_softticks="1"), true))
             cp = CrossPlatform(BBHostPlatform() => target)
             ft = FortranToolchain(cp;
                 env_prefixes=["HOST", "HOST_", ""],
@@ -116,6 +116,19 @@ ctoolchain_jlls(ct) = JLLSource[ct.binutils_toolchain.deps..., ct.deps...]
                 @test !occursin("ccache", script)
                 @test !occursin("CCACHE", script)
                 @test !occursin("_GLIBCXX_USE_CXX11_ABI", script)
+                # Software ticks platforms load the plugin, and predefine the macro, which the
+                # GCC plugin does not do in `gfortran`
+                @test occursin("-fplugin=", script) == softticks
+                @test occursin("-D__RR_SOFTTICKS__=1", script) == softticks
+                @test occursin("BB_SOFTTICKS_DISABLE", script) == softticks
+            end
+            if softticks
+                plugin = only(filter(jll -> jll.package.name ∈ BinaryBuilderToolchains.softticks_plugin_jlls, ft.deps))
+                @test plugin.package.name == "GCCSoftTicksPlugin_jll"
+                @test plugin.target == "softticks"
+                @test !haskey(tags(plugin.platform), "rr_softticks")
+            else
+                @test !any(jll -> jll.package.name ∈ BinaryBuilderToolchains.softticks_plugin_jlls, ft.deps)
             end
 
             env = toolchain_env(ft, "/opt/toolchain")
@@ -131,6 +144,7 @@ ctoolchain_jlls(ct) = JLLSource[ct.binutils_toolchain.deps..., ct.deps...]
             (;), (; vendor=:gcc_bootstrap), (; lock_microarchitecture=false), (; extra_fflags=["-I/x"]),
             (; extra_ldflags=["-L/x"]), (; env_prefixes=["HOST"]), (; wrapper_prefixes=["host-"]),
         )]
+        push!(keys, BinaryBuilderToolchains.cache_key(FortranToolchain(CrossPlatform(BBHostPlatform() => Platform("x86_64", "linux"; rr_softticks="1")))))
         @test allunique(keys)
         @test BinaryBuilderToolchains.cache_key(FortranToolchain(native)) == first(keys)
         @test startswith(first(keys), "FortranToolchain-")
