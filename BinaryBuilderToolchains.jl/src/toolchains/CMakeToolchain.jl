@@ -131,14 +131,29 @@ function generate_cmake_toolchain_file(toolchain::CMakeToolchain, io::IO)
     end
 end
 
-function toolchain_sources(toolchain::CMakeToolchain)
-    toolchain_prefix = "\$(dirname \"\${WRAPPER_DIR}\")"
-    function cmake_wrapper(io)
-        # If the user has not already passed in a `CMAKE_TOOLCHAIN_FILE`, insert ours
-        flagmatch(io, [!flag"-D[[:space:]]*CMAKE_TOOLCHAIN_FILE[=:].*"r]) do io
-            append_flags(io, :PRE, "-DCMAKE_TOOLCHAIN_FILE=$(toolchain_prefix)/wrappers/toolchain.cmake")
+"""
+    cmake_wrapper(io::IO, toolchain_file::String)
+
+Write the part of the `cmake` wrapper that points `cmake` at our toolchain file, by
+inserting `-DCMAKE_TOOLCHAIN_FILE=\$(toolchain_file)` before the user's arguments.  This
+only happens when `cmake` configures a project and the user did not pass a
+`CMAKE_TOOLCHAIN_FILE` of their own.  `cmake` only recognizes the modes that build,
+install or open a project, run a workflow preset, or run a command (`--build`,
+`--install`, `--open`, `--workflow` and `-E`) as its very first argument, so nothing may
+be inserted before them, and running a script (`-P`) has no use for a toolchain file.
+"""
+function cmake_wrapper(io::IO, toolchain_file::String)
+    first_arg_modes = [!flag"--build", !flag"--install", !flag"--open", !flag"--workflow", !flag"-E"]
+    flagmatch(io, first_arg_modes; match_target="\${ARGS[0]}") do io
+        flagmatch(io, [!flag"-P", !flag"-D[[:space:]]*CMAKE_TOOLCHAIN_FILE[=:].*"r]) do io
+            append_flags(io, :PRE, "-DCMAKE_TOOLCHAIN_FILE=$(toolchain_file)")
         end
     end
+end
+
+function toolchain_sources(toolchain::CMakeToolchain)
+    toolchain_prefix = "\$(dirname \"\${WRAPPER_DIR}\")"
+    toolchain_file = "$(toolchain_prefix)/wrappers/toolchain.cmake"
 
     cache_key = string(
         "CMake-",
@@ -160,7 +175,7 @@ function toolchain_sources(toolchain::CMakeToolchain)
             for wrapper_prefix in toolchain.wrapper_prefixes
                 tool_prefixed = string(replace(wrapper_prefix, "\${triplet}" => triplet(toolchain.platform.target)), "cmake")
                 compiler_wrapper(
-                    cmake_wrapper,
+                    io -> cmake_wrapper(io, toolchain_file),
                     identity,
                     joinpath(out_dir, tool_prefixed),
                     "$(toolchain_prefix)/cmake/bin/cmake",
