@@ -149,52 +149,17 @@ struct CToolchain <: AbstractToolchain
             throw(ArgumentError("Cannot have empty env prefixes!  Did you mean [\"\"]?"))
         end
 
-        if os(platform.target) == "linux" && isa(glibc_version, Symbol)
-            # If the user asks for the oldest version of glibc, figure out what platform we're
-            # building for, and use an appropriate version.
-            if glibc_version == :oldest
-                # TODO: Should glibc_version be embedded within the triplet somehow?
-                #       Non-default glibc version is kind of a compatibility issue....
-                @warn("TODO: Should glibc_version be embedded within the triplet?", maxlog=1)
-                if arch(platform.target) ∈ ("x86_64", "i686", "powerpc64le",)
-                    glibc_version = v"2.17"
-                elseif arch(platform.target) ∈ ("armv6l", "armv7l", "aarch64")
-                    glibc_version = v"2.19"
-                else
-                    throw(ArgumentError("Unknown oldest glibc version for architecture '$(platform.target)'!"))
-                end
-            else
-                throw(ArgumentError("Invalid magic glibc_version argument :$(glibc_version)"))
-            end
-        end
-
-        deps = jll_source_selection(
+        deps = compiler_jlls(
             get_vendor(vendor, platform),
             platform,
             gcc_version,
             llvm_version,
-            glibc_version,
+            resolve_glibc_version(glibc_version, platform),
             use_ccache,
             compiler_runtime,
             cxx_runtime,
         )
-        check_jll_pins(deps)
-
-        use_toolchain_universe!(deps)
-
-        # Concretize the JLLSource's `PackageSpec`'s version (and UUID) now. Not the
-        # software ticks plugins: they are resolved with the build's other dependencies,
-        # in the build's universe, where they may have been built.
-        resolve_versions!(filter(d -> d.package.name ∉ softticks_plugin_jlls, deps); julia_version=nothing)
-
-        gcc_version = nothing
-        for name in ("GCC", "GCCBootstrap")
-            jll = get_jll(deps, string(name, "_jll"))
-            if jll !== nothing
-                gcc_version = jll.package.version
-                break
-            end
-        end
+        gcc_version = installed_gcc_version(deps)
 
         wrapper_prefixes = string.(wrapper_prefixes)
         env_prefixes = string.(env_prefixes)
@@ -325,6 +290,89 @@ function get_linker(linker::Symbol, platform::AbstractPlatform)
 end
 get_linker(ct::CToolchain) = get_linker(ct.linker, ct.platform)
 
+
+"""
+    resolve_glibc_version(glibc_version, platform::CrossPlatform)
+
+The glibc version that a compiler toolchain for `platform` installs, given its
+`glibc_version` argument: on Linux, `:oldest` (the default) stands for the oldest glibc we
+support for the target's architecture.
+"""
+function resolve_glibc_version(glibc_version, platform::CrossPlatform)
+    if os(platform.target) == "linux" && isa(glibc_version, Symbol)
+        # If the user asks for the oldest version of glibc, figure out what platform we're
+        # building for, and use an appropriate version.
+        if glibc_version == :oldest
+            # TODO: Should glibc_version be embedded within the triplet somehow?
+            #       Non-default glibc version is kind of a compatibility issue....
+            @warn("TODO: Should glibc_version be embedded within the triplet?", maxlog=1)
+            if arch(platform.target) ∈ ("x86_64", "i686", "powerpc64le",)
+                glibc_version = v"2.17"
+            elseif arch(platform.target) ∈ ("armv6l", "armv7l", "aarch64")
+                glibc_version = v"2.19"
+            else
+                throw(ArgumentError("Unknown oldest glibc version for architecture '$(platform.target)'!"))
+            end
+        else
+            throw(ArgumentError("Invalid magic glibc_version argument :$(glibc_version)"))
+        end
+    end
+    return glibc_version
+end
+
+"""
+    compiler_jlls(vendor, platform, gcc_version, llvm_version, glibc_version, use_ccache,
+                  compiler_runtime, cxx_runtime)
+
+The JLLs that a compiler toolchain of `vendor` installs for `platform` (see
+`jll_source_selection()`), ready to use: pins checked, the toolchain universe's builds swapped
+in (`use_toolchain_universe!()`) and versions concretized.  Every toolchain that installs a
+compiler gets its JLLs from here (`CToolchain`, and `FortranToolchain` its GCC), so that the
+JLLs two of them share in one prefix come out identical, toolchain universe included, and
+`deduplicate_jlls()` merges them.
+"""
+function compiler_jlls(vendor::Symbol, platform::CrossPlatform,
+                       gcc_version,
+                       llvm_version,
+                       glibc_version,
+                       use_ccache,
+                       compiler_runtime,
+                       cxx_runtime)
+    deps = jll_source_selection(
+        vendor,
+        platform,
+        gcc_version,
+        llvm_version,
+        glibc_version,
+        use_ccache,
+        compiler_runtime,
+        cxx_runtime,
+    )
+    check_jll_pins(deps)
+
+    use_toolchain_universe!(deps)
+
+    # Concretize the JLLSource's `PackageSpec`'s version (and UUID) now. Not the
+    # software ticks plugins: they are resolved with the build's other dependencies,
+    # in the build's universe, where they may have been built.
+    resolve_versions!(filter(d -> d.package.name ∉ softticks_plugin_jlls, deps); julia_version=nothing)
+    return deps
+end
+
+"""
+    installed_gcc_version(deps::Vector{JLLSource})
+
+The version of the GCC (`GCC_jll` or `GCCBootstrap_jll`) among `deps`, or `nothing`.
+"""
+function installed_gcc_version(deps::Vector{JLLSource})
+    for name in ("GCC", "GCCBootstrap")
+        jll = get_jll(deps, string(name, "_jll"))
+        if jll !== nothing
+            return jll.package.version
+        end
+    end
+    return nothing
+end
 
 function jll_source_selection(vendor::Symbol, platform::CrossPlatform,
                               gcc_version,
@@ -878,6 +926,13 @@ function add_cxxabi_flags(io, toolchain)
 end
 
 """
+    extra_compile_flags(toolchain)
+
+The extra compiler flags the user gave `toolchain` (a `CToolchain`'s `extra_cflags`).
+"""
+extra_compile_flags(toolchain::CToolchain) = toolchain.extra_cflags
+
+"""
     add_user_flags(io, toolchain)
 
 The user can insert "extra" CFLAGS and LDFLAGS that they want our CToolchain
@@ -886,7 +941,7 @@ to use; this adds them to the relevant PRE and POST flag lists.
 function add_user_flags(io, toolchain)
     compile_flagmatch(io) do io
         # Add any extra CFLAGS the user has requested of us
-        append_flags(io, :PRE, toolchain.extra_cflags)
+        append_flags(io, :PRE, extra_compile_flags(toolchain))
     end
     link_flagmatch(io) do io
         # Add any extra linker flags that the user has requested of us
@@ -895,18 +950,21 @@ function add_user_flags(io, toolchain)
 end
 
 """
-    add_softticks_flags(io, toolchain, compiler::Symbol)
+    add_softticks_flags(io, toolchain, compiler::Symbol; ccache::Bool = true)
 
 On a software ticks platform (see `rr_softticks()`), load the software ticks plugin
 into every compilation, so that the code counts its own ticks, and predefine
 `__RR_SOFTTICKS__` (the ABI version) so that code the plugin cannot instrument (loops in
 inline or hand-written assembly) can tick by hand (`rr_softticks.h`). `compiler` is the
-wrapped compiler: `:gcc` loads the GCC plugin (`GCCSoftTicksPlugin_jll`, `-fplugin=`),
-`:clang` the LLVM pass plugin (`LLVMSoftTicksPlugin_jll`, `-fpass-plugin=`). The GCC
-plugin defines the macro itself too; an LLVM pass plugin runs after preprocessing and
-cannot, so the wrapper defines it for both. Setting `BB_SOFTTICKS_DISABLE` in the
-environment builds without either, for code that must not be instrumented (a tracer that
-runs on the platform, say).
+wrapped compiler: `:gcc` loads the GCC plugin (`GCCSoftTicksPlugin_jll`, `-fplugin=`)
+into any of GCC's drivers (`gcc`, `g++`, `gfortran`), `:clang` the LLVM pass plugin
+(`LLVMSoftTicksPlugin_jll`, `-fpass-plugin=`). The GCC plugin defines the macro itself
+too, but only in the C family's preprocessor (not in `gfortran`'s); an LLVM pass plugin
+runs after preprocessing and cannot, so the wrapper defines it for all of them. Setting
+`BB_SOFTTICKS_DISABLE` in the environment builds without either, for code that must not
+be instrumented (a tracer that runs on the platform, say). `ccache` says whether the
+wrapper may run the compiler through `ccache` (see below); the `gfortran` wrapper never
+does.
 
 LTO with clang: the pre-link compiles are not instrumented, the LTO backend in the linker
 must load the pass plugin too, and the clang driver does not pass it on. Of our linkers
@@ -914,7 +972,7 @@ only lld can (there is no LLVMgold), so a clang link with `-fuse-ld=lld` also ge
 `-Wl,--load-pass-plugin=` (harmless for a link without bitcode). An LTO link with any other
 linker fails anyway.
 """
-function add_softticks_flags(io, toolchain, compiler::Symbol)
+function add_softticks_flags(io, toolchain, compiler::Symbol; ccache::Bool = true)
     abi = rr_softticks(toolchain.platform.target)
     if abi === nothing
         return
@@ -930,10 +988,12 @@ function add_softticks_flags(io, toolchain, compiler::Symbol)
     # ccache keys its cache on the toolchain's `cache_key()` (`compiler_check`), which
     # does not cover the plugin's build: have it hash the plugin itself, or a rebuilt
     # plugin keeps getting objects compiled with the previous one.
-    plugin_file = compiler == :gcc ? "softticks_gcc.so" : "softticks_llvm.so"
-    println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
-    println(io, "    export CCACHE_EXTRAFILES=\"$(softticks_lib)/$(plugin_file)\${CCACHE_EXTRAFILES:+:\${CCACHE_EXTRAFILES}}\"")
-    println(io, "fi")
+    if ccache
+        plugin_file = compiler == :gcc ? "softticks_gcc.so" : "softticks_llvm.so"
+        println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
+        println(io, "    export CCACHE_EXTRAFILES=\"$(softticks_lib)/$(plugin_file)\${CCACHE_EXTRAFILES:+:\${CCACHE_EXTRAFILES}}\"")
+        println(io, "fi")
+    end
     compile_flagmatch(io) do io
         println(io, "if [[ -z \"\${BB_SOFTTICKS_DISABLE}\" ]]; then")
         append_flags(io, :PRE, [
@@ -998,6 +1058,93 @@ function add_macos_flags(io, toolchain)
 end
 
 """
+    add_gcc_driver_flags(io, toolchain, toolchain_prefix::String, gcc_version::VersionNumber;
+                         cxxabi::Bool = true, ccache::Bool = true)
+
+The body of a wrapper around one of GCC's drivers (`gcc`, `g++`, `cpp`, or `gfortran` for a
+`FortranToolchain`), installed under `toolchain_prefix`: the `-march` lock, the user's
+flags, the software ticks plugin, the macOS flags, GCC's own library directory, a
+reproducible `-frandom-seed` and the link-only flags.  `cxxabi` adds the C++ string ABI
+define (`add_cxxabi_flags()`), and `ccache` runs the compiler through `ccache` when the
+toolchain allows it (`add_ccache_preamble()`); both are for the C family's drivers only.
+"""
+function add_gcc_driver_flags(io, toolchain, toolchain_prefix::String, gcc_version::VersionNumber;
+                              cxxabi::Bool = true, ccache::Bool = true)
+    p = toolchain.platform.target
+    add_microarchitectural_flags(io, toolchain)
+    if cxxabi
+        add_cxxabi_flags(io, toolchain)
+    end
+    add_user_flags(io, toolchain)
+    add_softticks_flags(io, toolchain, :gcc; ccache)
+    add_macos_flags(io, toolchain)
+
+    compile_flagmatch(io) do io
+        if Sys.islinux(p) || Sys.isfreebsd(p)
+            # Help GCCBootstrap find its own libraries under
+            # `/opt/${target}/${target}/lib{,64}`.  Note: we need to push them directly in
+            # the wrappers before any additional arguments because we want this path to have
+            # precedence over anything else.  In this way for example we avoid libraries
+            # from `CompilerSupportLibraries_jll` in `${libdir}` are picked up by mistake.
+            @warn("TODO: determine if this flag prepending is actually needed", maxlog=1)
+            libdir = "$(toolchain_prefix)/$(gcc_target_triplet(p))/lib" * (nbits(p) == 32 ? "" : "64")
+            append_flags(io, :POST, ["-L$(libdir)", "-Wl,-rpath-link,$(libdir)"])
+        end
+
+        # Add on `-fsanitize-memory` if our platform has a santization tag applied
+        @warn("TODO: add sanitize compile flags!", maxlog=1)
+        #sanitize_compile_flags!(p, flags)
+    end
+
+    if Sys.isapple(p)
+        # Older GCC versions need the syslibroot specified directly
+        if gcc_version.major in (4, 5)
+            push!(flags, "-Wl,-syslibroot,$(toolchain_prefix)/$(gcc_target_triplet(p))")
+        end
+    end
+
+    # Use hash of arguments to provide the random seed, for increased reproducibility,
+    # but only do this if it has not already been specified:
+    flagmatch(io, [!flag"-frandom-seed"r]) do io
+        append_flags(io, :PRE, "-frandom-seed=0x\${ARGS_HASH}")
+    end
+
+    # Add link-time-only flags
+    link_flagmatch(io) do io
+        # Yes, it does seem that the inclusion of `/lib64` on `powerpc64le` was fixed
+        # in GCC 6, broken again in GCC 7, and then fixed again in GCC 8+
+        if arch(p) == "powerpc64le" && Sys.islinux(p) && gcc_version.major in (4, 5, 7)
+            append_flags(io, :POST, [
+                "-L$(toolchain_prefix)/$(gcc_target_triplet(p))/sys-root/lib64",
+                "-Wl,-rpath-link,$(toolchain_prefix)/$(gcc_target_triplet(p))/sys-root/lib64",
+            ])
+        end
+
+        # Do not embed timestamps, for reproducibility:
+        # https://github.com/JuliaPackaging/BinaryBuilder.jl/issues/1232
+        if Sys.iswindows(p)
+            append_flags(io, :POST, "-Wl,--no-insert-timestamp")
+        end
+
+        @warn("TODO: sanitize_link_flags()", maxlog=1)
+    end
+
+    if ccache
+        add_ccache_preamble(io, toolchain)
+    end
+end
+
+"""
+    gcc_driver_triplet(toolchain)
+
+The triplet that the GCC of `toolchain` prefixes its drivers with (`<triplet>-gcc`, ...).
+"""
+function gcc_driver_triplet(toolchain)
+    p = toolchain.platform.target
+    return get_vendor(toolchain) == :gcc_bootstrap ? gcc_target_triplet(p) : triplet(gcc_platform(p))
+end
+
+"""
     gcc_wrappers(toolchain::CToolchain, dir::String)
 
 Generate wrapper scripts (using `compiler_wrapper()`) into `dir` to launch
@@ -1007,72 +1154,13 @@ however if `toolchain.default_ctoolchain` is set, also generates the generic
 wrapper names `cc`, `gcc`, `c++`, etc...
 """
 function gcc_wrappers(toolchain::CToolchain, dir::String)
-    p = toolchain.platform.target
     toolchain_prefix = "\$(dirname \"\${WRAPPER_DIR}\")/gcc"
     gcc_version = something(toolchain.binutils_toolchain.gcc_version, v"0")
 
-    function _gcc_wrapper(io)
-        add_microarchitectural_flags(io, toolchain)
-        add_cxxabi_flags(io, toolchain)
-        add_user_flags(io, toolchain)
-        add_softticks_flags(io, toolchain, :gcc)
-        add_macos_flags(io, toolchain)
-
-        compile_flagmatch(io) do io
-            if Sys.islinux(p) || Sys.isfreebsd(p)
-                # Help GCCBootstrap find its own libraries under
-                # `/opt/${target}/${target}/lib{,64}`.  Note: we need to push them directly in
-                # the wrappers before any additional arguments because we want this path to have
-                # precedence over anything else.  In this way for example we avoid libraries
-                # from `CompilerSupportLibraries_jll` in `${libdir}` are picked up by mistake.
-                @warn("TODO: determine if this flag prepending is actually needed", maxlog=1)
-                libdir = "$(toolchain_prefix)/$(gcc_target_triplet(p))/lib" * (nbits(p) == 32 ? "" : "64")
-                append_flags(io, :POST, ["-L$(libdir)", "-Wl,-rpath-link,$(libdir)"])
-            end
-
-            # Add on `-fsanitize-memory` if our platform has a santization tag applied
-            @warn("TODO: add sanitize compile flags!", maxlog=1)
-            #sanitize_compile_flags!(p, flags)
-        end
-
-        if Sys.isapple(p)
-            # Older GCC versions need the syslibroot specified directly
-            if gcc_version.major in (4, 5)
-                push!(flags, "-Wl,-syslibroot,$(toolchain_prefix)/$(gcc_target_triplet(p))")
-            end
-        end
-
-        # Use hash of arguments to provide the random seed, for increased reproducibility,
-        # but only do this if it has not already been specified:
-        flagmatch(io, [!flag"-frandom-seed"r]) do io
-            append_flags(io, :PRE, "-frandom-seed=0x\${ARGS_HASH}")
-        end
-
-        # Add link-time-only flags
-        link_flagmatch(io) do io
-            # Yes, it does seem that the inclusion of `/lib64` on `powerpc64le` was fixed
-            # in GCC 6, broken again in GCC 7, and then fixed again in GCC 8+
-            if arch(p) == "powerpc64le" && Sys.islinux(p) && gcc_version.major in (4, 5, 7)
-                append_flags(io, :POST, [
-                    "-L$(toolchain_prefix)/$(gcc_target_triplet(p))/sys-root/lib64",
-                    "-Wl,-rpath-link,$(toolchain_prefix)/$(gcc_target_triplet(p))/sys-root/lib64",
-                ])
-            end
-
-            # Do not embed timestamps, for reproducibility:
-            # https://github.com/JuliaPackaging/BinaryBuilder.jl/issues/1232
-            if Sys.iswindows(p)
-                append_flags(io, :POST, "-Wl,--no-insert-timestamp")
-            end
-
-            @warn("TODO: sanitize_link_flags()", maxlog=1)
-        end
-
-        add_ccache_preamble(io, toolchain)
-    end
+    _gcc_wrapper(io) = add_gcc_driver_flags(io, toolchain, toolchain_prefix, gcc_version)
 
     # gcc, g++
-    gcc_triplet = get_vendor(toolchain) == :gcc_bootstrap ? gcc_target_triplet(p) : triplet(gcc_platform(p))
+    gcc_triplet = gcc_driver_triplet(toolchain)
     make_tool_wrappers(toolchain, dir, "gcc", "$(gcc_triplet)-gcc"; wrapper=_gcc_wrapper, toolchain_prefix)
     make_tool_wrappers(toolchain, dir, "g++", "$(gcc_triplet)-g++"; wrapper=_gcc_wrapper, toolchain_prefix)
 

@@ -44,7 +44,7 @@ struct BinutilsToolchain <: AbstractToolchain
         return new(
             platform,
             vendor,
-            use_toolchain_universe!(check_jll_pins(binutils_jll_source_selection(vendor, platform))),
+            binutils_jlls(vendor, platform),
             wrapper_prefixes,
             env_prefixes,
             use_ccache,
@@ -61,6 +61,16 @@ function Base.show(io::IO, toolchain::BinutilsToolchain)
     end
 end
 
+
+"""
+    binutils_jlls(vendor, platform)
+
+The binutils JLLs (`binutils_jll_source_selection()`) ready to use: pins checked and the
+toolchain universe's builds swapped in.  Every toolchain that runs a compiler driver, which
+runs the assembler and linker itself, installs these (`BinutilsToolchain`, and so
+`CToolchain`, and `FortranToolchain`), so that they come out identical in one prefix.
+"""
+binutils_jlls(vendor, platform) = use_toolchain_universe!(check_jll_pins(binutils_jll_source_selection(vendor, platform)))
 
 function binutils_jll_source_selection(vendor, platform)
     deps = JLLSource[]
