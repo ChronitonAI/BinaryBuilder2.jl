@@ -429,7 +429,14 @@ end
     registries = Pkg.Registry.reachable_registries(; depots=[depot_path(config.meta.universe)])
     for (idx, (prefix, srcs)) in enumerate(config.source_trees)
         srcs_hashes = bytes2hex.(spec_hash.(srcs; registries))
-        combined_hash = bytes2hex(sha1(string(srcs_hashes)))
+        # What a JLL source deploys is the artifacts `prepare()` resolved it to.  A JLL
+        # that the universe has rebuilt is resolved by name through the universe's
+        # environment, to new artifacts under the same `spec_hash()` (see
+        # `universe_jll_hashes()`), so key on the artifacts too: otherwise the deployment
+        # of its previous build is reused (a toolchain prefix kept a rebuilt
+        # `GCCSoftTicksPlugin_jll`'s old plugin).
+        artifact_hashes = [basename(path) for src in srcs if src isa JLLSource for path in src.artifact_paths]
+        combined_hash = bytes2hex(sha1(string(srcs_hashes, artifact_hashes)))
         host_path = builds_dir(string(idx, "-", combined_hash))
         @debug("BuildConfig source", prefix, srcs_hashes, combined_hash)
         mounts[prefix] = MountInfo(host_path, MountType.Overlayed)
