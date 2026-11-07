@@ -20,6 +20,11 @@ If a vector of URLs is given, they are tried in order until one of them yields a
 with the right hash.  The first URL is the primary one: it names the source (see
 `source()`) and keys its download cache, so adding mirrors does not invalidate a download.
 
+A file attached to a GitHub release
+(`https://github.com/<owner>/<repo>/releases/download/<tag>/<name>`) that GitHub refuses
+to serve from that URL, as for private repositories, is downloaded through the GitHub API
+instead; see `download_url()`.
+
 In the builder environment, the archive will be automatically unpacked to
 `\${WORKSPACE}/srcdir`, or in its subdirectory pointed to by the optional
 keyword `target`, if provided.
@@ -50,7 +55,8 @@ a `MultiHash`-compatible file integrity hash, typically a 64-character
 hexadecimal SHA256 hash.
 
 If a vector of URLs is given, they are tried in order, as for `ArchiveSource`, and
-the default `target` is the basename of the first one.
+the default `target` is the basename of the first one.  GitHub release files are
+downloaded as for `ArchiveSource`, too.
 
 In the builder environment, the file will be automatically deployed to
 `\${WORKSPACE}/srcdir/\$(target)`, where `basename(url)` is 
@@ -176,9 +182,7 @@ function prepare(fas::FileArchiveSource; verbose::Bool = false)
         errors = Pair{String,Any}[]
         for (idx, url) in enumerate(fas.urls)
             try
-                with_network_retries("Downloading $(url)") do
-                    download_verified(fas, url, download_target)
-                end
+                download_url(fas, url, download_target)
                 break
             catch e
                 if e isa InterruptException
@@ -200,6 +204,45 @@ function prepare(fas::FileArchiveSource; verbose::Bool = false)
         # If we still don't verify properly, throw an error
         if !verify(fas)
             throw(ArgumentError("Invalid hash"))
+        end
+    end
+end
+
+"""
+    download_url(fas::FileArchiveSource, url, download_target)
+
+Download `url` into `download_target` as `download_verified()` does, retrying network
+failures.  If `url` is the download URL of a file attached to a GitHub release
+(`https://github.com/<owner>/<repo>/releases/download/<tag>/<name>`) and GitHub answers
+it with an HTTP error, the file is looked up and downloaded through the GitHub API
+instead (see `github_release_asset_url()`).  That serves the same file, so it is checked
+against the same hash.  This is how files attached to releases of private repositories are
+downloaded (their download URLs do not accept tokens), and it also works where only the
+API is reachable, such as behind a proxy that refuses the download URLs.
+"""
+function download_url(fas::FileArchiveSource, url::String, download_target::String)
+    try
+        return with_network_retries("Downloading $(url)") do
+            download_verified(fas, url, download_target)
+        end
+    catch e
+        release_file = github_release_download(url)
+        if release_file === nothing || !is_http_error(e)
+            rethrow()
+        end
+        @info("Downloading $(url) failed (HTTP $(e.response.status)), downloading it through the GitHub API instead")
+        try
+            api_url = with_network_retries("Looking up $(url) through the GitHub API") do
+                github_release_asset_url(release_file...)
+            end
+            return with_network_retries("Downloading $(api_url)") do
+                download_verified(fas, api_url, download_target)
+            end
+        catch api_e
+            if api_e isa InterruptException
+                rethrow()
+            end
+            throw(GitHubReleaseDownloadError(url, e, api_e))
         end
     end
 end

@@ -862,6 +862,122 @@ end
     end
 end
 
+@testset "GitHub release downloads" begin
+    using BinaryBuilderSources: github_release_download, github_release_asset_url,
+                                percent_decode, percent_encode, GitHubReleaseDownloadError
+
+    @testset "release download URLs" begin
+        @test github_release_download("https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.34/OpenBLAS-0.3.34.tar.gz") ==
+              ("OpenMathLib", "OpenBLAS", "v0.3.34", "OpenBLAS-0.3.34.tar.gz")
+        # The tag and file name are percent-decoded
+        @test github_release_download("https://github.com/JuliaBinaryWrappers/libcellml_jll.jl/releases/download/libcellml-v0.4.0%2B0/libcellml-logs.v0.4.0.tar.gz") ==
+              ("JuliaBinaryWrappers", "libcellml_jll.jl", "libcellml-v0.4.0+0", "libcellml-logs.v0.4.0.tar.gz")
+        # Tags may contain slashes
+        @test github_release_download("https://github.com/Foo/Bar/releases/download/llvm/v1.0/foo%20bar.tar.gz") ==
+              ("Foo", "Bar", "llvm/v1.0", "foo bar.tar.gz")
+        for url in ("https://github.com/Foo/Bar/archive/refs/tags/v1.0.tar.gz",
+                    "https://github.com/Foo/Bar/releases/latest/download/foo.tar.gz",
+                    "https://github.com/Foo/Bar/releases/download/v1.0/foo.tar.gz?raw=true",
+                    "https://github.com/Foo/Bar/releases/download/v1.0/",
+                    "http://github.com/Foo/Bar/releases/download/v1.0/foo.tar.gz",
+                    "https://example.com/Foo/Bar/releases/download/v1.0/foo.tar.gz",
+                    "https://api.github.com/repos/Foo/Bar/releases/assets/12345")
+            @test github_release_download(url) === nothing
+        end
+
+        # Tags go into the API URL as a single path segment
+        @test percent_encode("libcellml-v0.4.0+0") == "libcellml-v0.4.0%2B0"
+        @test percent_encode("llvm/v1.0~rc_1") == "llvm%2Fv1.0~rc_1"
+        @test percent_decode(percent_encode("ü +/%")) == "ü +/%"
+        # Things that are not escapes are left alone
+        @test percent_decode("100%") == "100%"
+        @test percent_decode("%zz%2") == "%zz%2"
+    end
+
+    @testset "asset lookup" begin
+        api = "https://api.github.com/repos/Foo/Bar"
+        asset(name, id) = Dict("name" => name, "url" => "$(api)/releases/assets/$(id)")
+        many_assets = [asset("file$(i).tar.gz", 100 + i) for i in 1:150]
+        responses = Dict(
+            "$(api)/releases/tags/v1.0%2B0" => Dict(
+                "assets_url" => "$(api)/releases/7/assets",
+                "assets" => [asset("a.tar.gz", 1), asset("b+c.tar.gz", 2)],
+            ),
+            "$(api)/releases/7/assets?per_page=100&page=1" => many_assets[1:100],
+            "$(api)/releases/7/assets?per_page=100&page=2" => many_assets[101:end],
+        )
+        requests = String[]
+        function get_json(url)
+            push!(requests, url)
+            return responses[url]
+        end
+        lookup(name) = github_release_asset_url("Foo", "Bar", "v1.0+0", name; get_json)
+
+        @test lookup("b+c.tar.gz") == "$(api)/releases/assets/2"
+        @test requests == ["$(api)/releases/tags/v1.0%2B0"]
+
+        # A file the release itself does not list is looked for in its asset list
+        empty!(requests)
+        @test lookup("file142.tar.gz") == "$(api)/releases/assets/242"
+        @test length(requests) == 3
+
+        # A file that is not there at all is an error once the list runs out
+        empty!(requests)
+        @test_throws ArgumentError lookup("missing.tar.gz")
+        @test length(requests) == 3
+    end
+
+    # These download from GitHub.  Where GitHub serves release download URLs, they get
+    # downloaded directly; where it does not, they go through the GitHub API.
+    @testset "downloads" begin
+        url = "https://github.com/JuliaBinaryWrappers/libcellml_jll.jl/releases/download/libcellml-v0.4.0%2B0/libcellml-logs.v0.4.0.x86_64-w64-mingw32-cxx03.tar.gz"
+        hash = "237013b20851355c4c1d22ceac7e73207b44d989d38b6874187d333adfc79c77"
+        api_url = github_release_asset_url(github_release_download(url)...)
+        @test occursin(r"^https://api\.github\.com/repos/JuliaBinaryWrappers/libcellml_jll\.jl/releases/assets/\d+$", api_url)
+
+        with_temp_storage_locations() do
+            # The API URL serves the same file
+            fs = FileSource(api_url, hash; target="libcellml-logs.tar.gz")
+            prepare(fs)
+            @test verify(fs)
+
+            # The release download URL works, one way or the other, and is still the
+            # name of the source
+            as = ArchiveSource(url, hash)
+            prepare(as)
+            @test verify(as)
+            @test source(as) == url
+
+            function prepare_error(fas)
+                try
+                    prepare(fas)
+                catch e
+                    return e
+                end
+                return nothing
+            end
+
+            # A file the release does not have fails both ways, and we see both errors
+            missing_url = replace(url, "libcellml-logs." => "libcellml-nothing.")
+            err = prepare_error(FileSource(missing_url, hash))
+            @test err isa GitHubReleaseDownloadError
+            @test err.url == missing_url
+            @test err.error isa Downloads.RequestError
+            @test err.api_error isa ArgumentError
+            msg = sprint(showerror, err)
+            @test occursin("downloading $(missing_url) failed", msg)
+            @test occursin("no file named 'libcellml-nothing.v0.4.0.x86_64-w64-mingw32-cxx03.tar.gz'", msg)
+            @test !verify(FileSource(missing_url, hash))
+
+            # So does one from a release that does not exist
+            err = prepare_error(FileSource(replace(url, "v0.4.0%2B0" => "v0.0.0%2B0"), hash))
+            @test err isa GitHubReleaseDownloadError
+            @test err.api_error isa Downloads.RequestError
+            @test err.api_error.response.status == 404
+        end
+    end
+end
+
 @testset "make_thin_depot!" begin
     using BinaryBuilderSources: make_thin_depot!
     mktempdir() do dir

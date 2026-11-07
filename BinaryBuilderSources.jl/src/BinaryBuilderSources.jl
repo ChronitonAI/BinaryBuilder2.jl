@@ -133,6 +133,7 @@ function content_hash end
 
 
 include("Retry.jl")
+include("GitHubReleases.jl")
 include("FileArchiveSource.jl")
 include("DirectorySource.jl")
 include("GeneratedSource.jl")
