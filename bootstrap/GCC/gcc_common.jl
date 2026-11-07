@@ -127,9 +127,47 @@ const gcc_version_sources = Dict{VersionNumber,Vector}(
     ],
 )
 
+# The languages GCC is built with by default (`gcc_script()`).
+const gcc_default_languages = ("c", "c++", "fortran")
 
-script = raw"""
+"""
+    gcc_languages(build_platform, platform::CrossPlatform; languages = gcc_default_languages)
+
+The languages `gcc_script(; languages)` builds GCC for `platform` (`host => target`) with,
+on a `build_platform` machine: `languages`, but without Fortran for a canadian cross
+(`host` is not `build_platform`). GCC compiles its Fortran runtime library (libgfortran)
+with the gfortran it builds, which a canadian cross cannot run, and it would need a
+gfortran for the target installed instead; our bootstrap compilers have none.
+"""
+function gcc_languages(build_platform::AbstractPlatform, platform::CrossPlatform;
+                       languages = gcc_default_languages)
+    languages = collect(String, languages)
+    if triplet(gcc_platform(build_platform)) != triplet(gcc_platform(platform.host))
+        filter!(!=("fortran"), languages)
+    end
+    return languages
+end
+
+"""
+    gcc_script(; languages = gcc_default_languages)
+
+The build script for GCC, built with `languages` (`--enable-languages`), less those that
+`gcc_languages()` drops for the platform being built. With `"fortran"`, GCC also builds
+gfortran and its runtime libraries: libgfortran, and libquadmath where the target has
+`__float128` (`gcc_has_libquadmath()`).
+"""
+function gcc_script(; languages = gcc_default_languages)
+    return string("GCC_LANGUAGES=\"", join(languages, ","), "\"\n", gcc_script_body)
+end
+
+gcc_script_body = raw"""
 cd ${WORKSPACE}/srcdir
+
+# A canadian cross cannot run the gfortran it builds to compile libgfortran (`gcc_languages()`)
+if [[ "${build}" != "${host}" ]] && [[ ",${GCC_LANGUAGES}," == *,fortran,* ]]; then
+    echo "Building ${host} => ${target} on ${build}: no Fortran" >&2
+    GCC_LANGUAGES="$(echo ",${GCC_LANGUAGES}," | sed -e 's/,fortran,/,/' -e 's/^,//' -e 's/,$//')"
+fi
 
 # Figure out the GCC version from the directory name
 gcc_version="$(echo gcc-* | cut -d- -f2)"
@@ -284,7 +322,7 @@ $WORKSPACE/srcdir/gcc-*/configure \
     --disable-bootstrap \
     --disable-werror \
     --enable-threads=posix \
-    --enable-languages=c,c++ \
+    --enable-languages="${GCC_LANGUAGES}" \
     --with-build-sysroot="${target_prefix}/${target}" \
     --with-sysroot="${host_prefix}/${target}" \
     --program-prefix="${target}-" \
@@ -304,7 +342,53 @@ rm -rf ${prefix}/share/man
 install_license ${WORKSPACE}/srcdir/gcc-*/COPYING*
 """
 
-function gcc_extract_spec_generator(build::BuildConfig, platform::AbstractPlatform)
+script = gcc_script()
+
+"""
+    gcc_has_libquadmath(target::AbstractPlatform)
+
+Whether GCC builds libquadmath (with Fortran) for `target`: only where `__float128` exists.
+"""
+gcc_has_libquadmath(target::AbstractPlatform) = arch(target) ∈ ("x86_64", "i686", "powerpc64le")
+
+"""
+    gcc_extract_spec_generator(build::BuildConfig, platform; languages = gcc_default_languages)
+
+Split what `gcc_script(; languages)` installs into the `GCC` (the compilers), `GCC_support_libraries`,
+`GCC_crt_objects` and `libstdcxx` JLLs. Fortran (if `gcc_languages()` builds it) adds `gfortran` to
+`GCC`, libgfortran and libquadmath to `GCC_support_libraries`, and its intrinsic modules
+(`finclude`) to `GCC_crt_objects`.
+"""
+function gcc_extract_spec_generator(build::BuildConfig, platform::AbstractPlatform;
+                                    languages = gcc_default_languages)
+    build_platform = get_target_spec_by_name(build, "build").platform.target
+    fortran = "fortran" ∈ gcc_languages(build_platform, platform; languages)
+
+    gcc_products = [
+        ExecutableProduct("\${target}-gcc", :gcc),
+        ExecutableProduct("\${target}-g++", :gxx),
+    ]
+    support_library_products = [
+        LibraryProduct([
+                # The library itself, not the `libgcc_s.so` linker script next to it (Linux,
+                # FreeBSD): libgfortran's dependency on `libgcc_s.so.1` must resolve to this product
+                raw"${target}/${lib64}/libgcc_s.so.1",
+                raw"${target}/${lib64}/libgcc_s",
+                # Special windows naming of libgcc_s
+                raw"${target}/${lib64}/libgcc_s_seh",
+                raw"${target}/${lib64}/libgcc_s_sjlj",
+            ],
+            :libgcc_s
+        ),
+    ]
+    if fortran
+        push!(gcc_products, ExecutableProduct("\${target}-gfortran", :gfortran))
+        push!(support_library_products, LibraryProduct([raw"${target}/${lib64}/libgfortran"], :libgfortran))
+        if gcc_has_libquadmath(platform.target)
+            push!(support_library_products, LibraryProduct([raw"${target}/${lib64}/libquadmath"], :libquadmath))
+        end
+    end
+
     gcc_crt_object_names = ["libgcc.a"]
     if Sys.isapple(platform.target)
         append!(gcc_crt_object_names, ["crttms.o", "crt3.o"])
@@ -315,6 +399,10 @@ function gcc_extract_spec_generator(build::BuildConfig, platform::AbstractPlatfo
         FileProduct([string(raw"lib/gcc/${target}/${gcc_version}/", name)],
                     Symbol(replace(name, "." => "_"))) for name in gcc_crt_object_names
     ]
+    if fortran
+        # The intrinsic modules (`ieee_arithmetic`, `omp_lib`, ...), which `gfortran` finds there
+        push!(gcc_crt_object_products, FileProduct([raw"lib/gcc/${target}/${gcc_version}/finclude"], :finclude))
+    end
     return ExtractSpec[
         ExtractSpec(
             raw"""
@@ -336,16 +424,7 @@ function gcc_extract_spec_generator(build::BuildConfig, platform::AbstractPlatfo
             # Remove `libstdc++`, as that was extracted in `libstdcxx`
             rm -f ${extract_dir}/${target}/${lib64}/libstdc++*
             """,
-            [
-                LibraryProduct([
-                        raw"${target}/${lib64}/libgcc_s",
-                        # Special windows naming of libgcc_s
-                        raw"${target}/${lib64}/libgcc_s_seh",
-                        raw"${target}/${lib64}/libgcc_s_sjlj",
-                    ],
-                    :libgcc_s
-                ),
-            ],
+            support_library_products,
             get_target_spec_by_name(build, "host");
             jll_name = "GCC_support_libraries",
             platform = platform.target,
@@ -379,10 +458,7 @@ function gcc_extract_spec_generator(build::BuildConfig, platform::AbstractPlatfo
                 mv ${extract_dir}/gcc_plugin ${extract_dir}/${plugin_dir}
             fi
             """,
-            [
-                ExecutableProduct("\${target}-gcc", :gcc),
-                ExecutableProduct("\${target}-g++", :gxx),
-            ],
+            gcc_products,
             get_target_spec_by_name(build, "host");
             # The `GCC` extraction explicitly does not depend on the JLLs above,
             # because they are `target` and not cross-platform, thus do not get

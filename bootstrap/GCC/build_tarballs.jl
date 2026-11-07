@@ -16,6 +16,8 @@ for version in (v"14.2.0",) #keys(gcc_version_sources)
             FileProduct("bin", :bindir),
             ExecutableProduct("\${target}-gcc", :gcc),
             ExecutableProduct("\${target}-g++", :gxx),
+            # Not on a canadian cross (`gcc_languages()`); `gcc_extract_spec_generator()` knows
+            ExecutableProduct("\${target}-gfortran", :gfortran),
         ],
         build_spec_generator = gcc_build_spec_generator,
         extract_spec_generator = gcc_extract_spec_generator,

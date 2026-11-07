@@ -73,7 +73,8 @@ for version in (v"14.2.0",)
             gcc_version_sources[version]...,
             DirectorySource("./patches-v$(version)"; follow_symlinks=true, target="patches"),
         ],
-        script,
+        # A bootstrap compiler, which needs C and C++ only
+        script = gcc_script(; languages = ("c", "c++")),
         platforms,
         products = [
             FileProduct("bin", :bindir),
