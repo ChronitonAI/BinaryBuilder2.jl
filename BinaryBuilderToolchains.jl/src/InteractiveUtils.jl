@@ -130,8 +130,14 @@ function with_toolchains(f::Function, toolchains::Vector{<:AbstractToolchain};
                          deploy_dir::Union{Nothing,String} = nothing,
                          env = ENV,
                          verbose::Bool = false)
-    # Collect the sources from the toolchains
+    # Collect the sources from the toolchains.  They all go into one prefix, so merge the
+    # JLLs that several of them install (e.g. the GCC of a `CToolchain` and a
+    # `FortranToolchain`), as a build does for each of its prefixes.
     srcs = reduce(vcat, toolchain_sources.(toolchains))
+    srcs = AbstractSource[
+        filter(src -> !isa(src, JLLSource), srcs)...,
+        deduplicate_jlls(JLLSource[src for src in srcs if isa(src, JLLSource)])...,
+    ]
 
     # Prepare all sources.  We do this in one `prepare()` invocation, as
     # there can be efficiency benefits, especially when `deploy()`'ing later.
