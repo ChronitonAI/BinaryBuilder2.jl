@@ -948,7 +948,9 @@ function register_jll!(u::Universe, jll::JLLInfo; skip_artifact_export::Bool = f
         else
             src_branch = head_branch(jll_bare_repo)
         end
-        checkout!(jll_bare_repo, jll_path, src_branch; verbose)
+        # Not a shared clone: the next `register_jll!()` of this JLL, in any universe, deletes
+        # and re-creates the bare repo, and a dev repo borrowing its objects would lose them.
+        checkout!(jll_bare_repo, jll_path, src_branch; shared=false, verbose)
         return repo_url
     end
     if uni_branch_name !== nothing

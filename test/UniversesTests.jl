@@ -47,6 +47,31 @@ using BinaryBuilder2: update_registries!, registries_to_download, registry_path,
     end
 end
 
+@testset "Dev repos survive registrations in other universes" begin
+    # Every `register_jll!()` re-creates the shared bare repo of the JLL in the download
+    # cache; another universe's dev repo of the same JLL must not depend on its objects.
+    mktempdir() do dir
+        hwc_jll = include(joinpath(pkgdir(JLLGenerator), "contrib", "example_jllinfos", "HelloWorldC_jll.jl"))
+        hwc_jll = @set hwc_jll.name = "HelloWorldC3"
+        hwc_jll = @set hwc_jll.version = v"1.3.0"
+        hwc_jll = @set hwc_jll.builds = map(hwc_jll.builds) do build
+            build = @set build.src_version = v"1.3.0"
+            build = @set build.name = "HelloWorldC3"
+            return build
+        end
+        uni_a = Universe("bb2_tests_a"; depot_path=joinpath(dir, "a"))
+        uni_b = Universe("bb2_tests_b"; depot_path=joinpath(dir, "b"))
+        register_jll!(uni_a, hwc_jll; skip_artifact_export=true)
+        dev_a = joinpath(uni_a.depot_path, "dev", "HelloWorldC3_jll")
+        @test !isfile(joinpath(dev_a, ".git", "objects", "info", "alternates"))
+        register_jll!(uni_b, hwc_jll; skip_artifact_export=true)
+        @test success(`git -C $(dev_a) fsck --full`)
+        mktempdir() do clone_dir
+            @test success(`git clone --quiet $(dev_a) $(joinpath(clone_dir, "x"))`)
+        end
+    end
+end
+
 @testset "Registry downloads" begin
     # We want every session to start from an up-to-date registry, but we only want to
     # pay for that once, no matter how many `Universe`s get built on top of it.

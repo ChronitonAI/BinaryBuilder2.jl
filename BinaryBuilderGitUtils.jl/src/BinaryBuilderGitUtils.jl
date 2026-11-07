@@ -249,11 +249,21 @@ function head_branch(repo_path::String; default::String="main")
     end
 end
 
-function checkout!(repo_path::String, target::String, commit::HashOrString = head_branch(repo_path); verbose::Bool = false)
+"""
+    checkout!(repo_path, target, commit = head_branch(repo_path); shared = true, verbose = false)
+
+Check out `commit` of the repository at `repo_path` into a new clone at `target`.
+With `shared = true` (`git clone --shared`) the clone borrows `repo_path`'s objects
+instead of copying them, so it breaks when `repo_path` is deleted or re-created; pass
+`shared = false` for a clone that must outlive `repo_path` (its objects are then
+hard-linked where the filesystem allows, else copied).
+"""
+function checkout!(repo_path::String, target::String, commit::HashOrString = head_branch(repo_path);
+                   shared::Bool = true, verbose::Bool = false)
     if !iscommit(repo_path, commit)
         fetch!(repo_path; verbose)
     end
-    run(git(["clone", "--shared", repo_path, target, quiet_args(verbose)...]))
+    run(git(["clone", (shared ? ("--shared",) : ())..., repo_path, target, quiet_args(verbose)...]))
     run(git(["-C", target, "checkout", quiet_args(verbose)..., to_commit_str(commit)]))
 end
 

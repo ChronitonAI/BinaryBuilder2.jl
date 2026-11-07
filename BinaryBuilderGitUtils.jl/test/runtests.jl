@@ -142,6 +142,23 @@ end
             @test isfile(joinpath(second_working_dir, "foo.txt"))
         end
 
+        # A non-shared checkout keeps working after its source repository is replaced
+        mktempdir() do tmp
+            src_dir = joinpath(tmp, "src")
+            clone!(bare_dir, src_dir)
+            shared_dir = joinpath(tmp, "shared")
+            unshared_dir = joinpath(tmp, "unshared")
+            checkout!(src_dir, shared_dir, "main")
+            checkout!(src_dir, unshared_dir, "main"; shared=false)
+            @test isfile(joinpath(shared_dir, ".git", "objects", "info", "alternates"))
+            @test !isfile(joinpath(unshared_dir, ".git", "objects", "info", "alternates"))
+            rm(src_dir; recursive=true)
+            init!(src_dir)
+            @test !success(BinaryBuilderGitUtils.git(["-C", shared_dir, "fsck", "--full"]))
+            @test success(BinaryBuilderGitUtils.git(["-C", unshared_dir, "fsck", "--full"]))
+            @test length(log(unshared_dir)) == 2
+        end
+
         mktempdir() do second_bare_clone
             rm(second_bare_clone)
             clone!(bare_dir, second_bare_clone)
