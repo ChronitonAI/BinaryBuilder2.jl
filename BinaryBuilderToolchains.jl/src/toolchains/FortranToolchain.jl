@@ -28,9 +28,9 @@ The wrappers do not use `ccache`, which cannot cache Fortran.  GCC 14's `libgfor
 
 On a software ticks platform (`rr_softticks`), the wrappers load the software ticks plugin
 (`GCCSoftTicksPlugin_jll`, which the toolchain installs) into `gfortran` and define
-`__RR_SOFTTICKS__`, as the C toolchain's do (`add_softticks_flags()`); the wrapper's
-definition is the only one there, as the plugin defines the macro in the C family's
-preprocessor only.
+`__RR_SOFTTICKS__`, as the C toolchain's do (`add_softticks_flags()`).  Newer builds of the
+plugin define the macro in gfortran's preprocessor themselves, with the same value; older
+ones only in the C family's, so the wrapper's `-D` is what preprocessed Fortran relies on.
 """
 struct FortranToolchain <: AbstractToolchain
     platform::CrossPlatform

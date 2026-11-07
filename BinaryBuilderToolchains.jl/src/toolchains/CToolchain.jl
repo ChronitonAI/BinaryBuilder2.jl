@@ -959,8 +959,8 @@ inline or hand-written assembly) can tick by hand (`rr_softticks.h`). `compiler`
 wrapped compiler: `:gcc` loads the GCC plugin (`GCCSoftTicksPlugin_jll`, `-fplugin=`)
 into any of GCC's drivers (`gcc`, `g++`, `gfortran`), `:clang` the LLVM pass plugin
 (`LLVMSoftTicksPlugin_jll`, `-fpass-plugin=`). The GCC plugin defines the macro itself
-too, but only in the C family's preprocessor (not in `gfortran`'s); an LLVM pass plugin
-runs after preprocessing and cannot, so the wrapper defines it for all of them. Setting
+too (older builds of it only in the C family's preprocessor, not in `gfortran`'s); an LLVM
+pass plugin runs after preprocessing and cannot, so the wrapper defines it for all of them. Setting
 `BB_SOFTTICKS_DISABLE` in the environment builds without either, for code that must not
 be instrumented (a tracer that runs on the platform, say). `ccache` says whether the
 wrapper may run the compiler through `ccache` (see below); the `gfortran` wrapper never
