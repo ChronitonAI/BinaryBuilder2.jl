@@ -106,6 +106,23 @@ function PlatformlessWrapper(cmt::CMakeToolchain)
     return CMakeToolchain(;vendor=BinaryBuilderToolchains.get_vendor(cmt))
 end
 
+# FortranToolchain support
+function BinaryBuilderToolchains.FortranToolchain(; kwargs...)
+    return PlatformlessWrapper{FortranToolchain}(;kwargs=Dict(kwargs...))
+end
+function apply_platform(pw::PlatformlessWrapper{FortranToolchain}, platform::CrossPlatform)
+    return FortranToolchain(platform; pw.kwargs...)
+end
+function apply_platform(ft::FortranToolchain, p::AbstractPlatform)
+    if !platforms_match(ft.platform, p)
+        throw(ArgumentError("Attempted to `apply_platform` a FortranToolchain with platform $(triplet(ft.platform)) but for $(triplet(p))"))
+    end
+    return ft
+end
+function PlatformlessWrapper(ft::FortranToolchain)
+    return FortranToolchain(;vendor=ft.vendor)
+end
+
 # HostToolsToolchain support
 function BinaryBuilderToolchains.HostToolsToolchain(;kwargs...)
     return PlatformlessWrapper{HostToolsToolchain}(;kwargs=kwargs)

@@ -115,6 +115,21 @@ function alter_toolchain(target_prefix::String, pw::PlatformlessWrapper{CToolcha
     ]
     return pw
 end
+function alter_toolchain(target_prefix::String, pw::PlatformlessWrapper{FortranToolchain})
+    pw = copy(pw)
+
+    # Add FFLAGS and LDFLAGS for the install prefix, as for a `CToolchain`: `-I` is also
+    # where `gfortran` looks for the modules (`.mod` files) that dependencies install.
+    pw.kwargs[:extra_fflags] = String[
+        get(pw.kwargs, :extra_fflags, String[])...,
+        "-I$(target_prefix)/include",
+    ]
+    pw.kwargs[:extra_ldflags] = String[
+        get(pw.kwargs, :extra_ldflags, String[])...,
+        "-L$(target_prefix)/lib",
+    ]
+    return pw
+end
 alter_toolchain(::String, pw::PlatformlessWrapper) = pw
 alter_toolchain(::String, toolchain::AbstractToolchain) = toolchain
 

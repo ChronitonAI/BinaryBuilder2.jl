@@ -33,6 +33,10 @@ end
 
 Map a BinaryBuilder1-style `compilers` list (e.g. `[:c]`) to a `(target_toolchains,
 host_toolchains)` tuple.  The host always receives `HostToolsToolchain()`.
+
+`:fortran` adds a `FortranToolchain()` (`gfortran`, `\$FC`), which BinaryBuilder1 has no
+compiler name for: there, `:c` comes with `gfortran`.  Here a recipe opts into Fortran
+with `compilers = [:c, :fortran]`.
 """
 function compilers_to_toolchains(compilers::Vector{Symbol})
     target_toolchains = []
@@ -42,6 +46,9 @@ function compilers_to_toolchains(compilers::Vector{Symbol})
             # BinaryBuilder1's `:c` compiler set always came with CMake as well
             append!(target_toolchains, [CToolchain(), CMakeToolchain()])
             append!(host_toolchains, [CToolchain(), CMakeToolchain()])
+        elseif compiler == :fortran
+            push!(target_toolchains, FortranToolchain())
+            push!(host_toolchains, FortranToolchain())
         else
             throw(ArgumentError("BinaryBuilder1 compiler `:$(compiler)` is not yet supported by BinaryBuilder2"))
         end

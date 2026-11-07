@@ -94,6 +94,48 @@ end
         @test any(isa.(host_toolchains, PlatformlessWrapper{CToolchain}))
         @test any(isa.(host_toolchains, PlatformlessWrapper{HostToolsToolchain}))
         @test_throws ArgumentError BinaryBuilder2.Compat.compilers_to_toolchains([:c, :rust])
+        @test !any(isa.(target_toolchains, PlatformlessWrapper{FortranToolchain}))
+
+        # Recipes opt into Fortran with `:fortran`
+        target_toolchains, host_toolchains = BinaryBuilder2.Compat.compilers_to_toolchains([:c, :fortran])
+        @test any(isa.(target_toolchains, PlatformlessWrapper{CToolchain}))
+        @test any(isa.(target_toolchains, PlatformlessWrapper{FortranToolchain}))
+        @test any(isa.(host_toolchains, PlatformlessWrapper{FortranToolchain}))
+    end
+
+    @testset "FortranToolchain" begin
+        native_linux = Platform(arch(HostPlatform()), "linux")
+        spec_plan = make_target_spec_plan(;
+            host_toolchains = [CToolchain(), FortranToolchain(), HostToolsToolchain()],
+            target_toolchains = [CToolchain(), FortranToolchain()],
+        )
+        target_specs = apply_spec_plan(spec_plan, native_linux, native_linux)
+        config = BuildConfig(BuildMeta(; dry_run=["build"]), "fortran", v"1.0.0", [], target_specs, "true")
+        for bts in target_specs
+            ct = only(filter(t -> isa(t, CToolchain), bts.toolchains))
+            ft = only(filter(t -> isa(t, FortranToolchain), bts.toolchains))
+            # Its flags point at the spec's install prefix, whose `include` holds modules too
+            prefix = BinaryBuilder2.target_prefix(bts)
+            @test ft.extra_fflags == ["-I$(prefix)/include"]
+            @test ft.extra_ldflags == ["-L$(prefix)/lib"]
+            # Its wrappers and variables are named like the C compilers
+            @test ft.wrapper_prefixes == ct.wrapper_prefixes
+            @test ft.env_prefixes == ct.env_prefixes
+            # It shares the C toolchain's GCC: each JLL is installed once
+            jlls = [src for src in config.source_trees[BinaryBuilder2.toolchain_prefix(bts, ft)] if isa(src, JLLSource)]
+            @test allunique([jll.package.name for jll in jlls])
+            @test any(jll -> jll.package.name == "GCC_jll", jlls)
+
+            @test BinaryBuilder2.apply_platform(ft, bts.platform) === ft
+            @test isa(PlatformlessWrapper(ft), PlatformlessWrapper{FortranToolchain})
+        end
+        gfortran(prefix) = string(prefix, triplet(native_linux), "-gfortran")
+        for var in ("FC", "TARGETFC", "TARGET_FC")
+            @test config.env[var] == gfortran("target-")
+        end
+        for var in ("HOSTFC", "HOST_FC")
+            @test config.env[var] == gfortran("host-")
+        end
     end
 
     @testset "host and build deps" begin
