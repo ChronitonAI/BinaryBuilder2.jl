@@ -137,6 +137,33 @@ cache_key(toolchain::FortranToolchain) = toolchain.cache_key
 extra_compile_flags(toolchain::FortranToolchain) = toolchain.extra_fflags
 platform(toolchain::FortranToolchain) = toolchain.platform
 
+"""
+    add_user_flags(io, toolchain::FortranToolchain)
+
+As for the C toolchains (the extra flags to each compilation and link), but each `-I<dir>`
+among the extra compiler flags is only passed while `<dir>` exists: `gfortran` (since GCC
+13) warns about every directory given with `-I` that does not exist
+(`-Wmissing-include-dirs` is on by default), which `-Werror` turns into an error, and the
+`include` directory of a build's install prefix (see `alter_toolchain()`) only exists once
+something has been installed there.
+"""
+function add_user_flags(io, toolchain::FortranToolchain)
+    compile_flagmatch(io) do io
+        for flag in extra_compile_flags(toolchain)
+            if startswith(flag, "-I") && length(flag) > 2
+                bash_if_statement(io, "-d \"$(flag[3:end])\"") do io
+                    append_flags(io, :PRE, flag)
+                end
+            else
+                append_flags(io, :PRE, flag)
+            end
+        end
+    end
+    link_flagmatch(io) do io
+        append_flags(io, :POST, toolchain.extra_ldflags)
+    end
+end
+
 function Base.show(io::IO, toolchain::FortranToolchain)
     println(io, "FortranToolchain ($(toolchain.platform))")
     for dep in toolchain.deps

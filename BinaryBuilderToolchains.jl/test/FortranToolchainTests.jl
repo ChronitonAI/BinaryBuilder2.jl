@@ -109,6 +109,8 @@ ctoolchain_jlls(ct) = JLLSource[ct.binutils_toolchain.deps..., ct.deps...]
                 @test occursin("Cannot force an architecture via -march", script)
                 @test occursin("\"-march=", script)
                 @test occursin("\"-I/prefix/include\"", script)
+                # (only while it exists)
+                @test occursin("[[ -d \"/prefix/include\" ]]", script)
                 @test occursin("\"-L/prefix/lib\"", script)
                 @test occursin("-Wl,-rpath-link,", script)
                 @test occursin("-frandom-seed=", script)
@@ -167,6 +169,34 @@ ctoolchain_jlls(ct) = JLLSource[ct.binutils_toolchain.deps..., ct.deps...]
                 return
             end
             toolchain_tests(prefix, runtime_env(prefix, env), native, "FortranToolchain")
+        end
+    end
+
+    # The install prefix's `include` is only passed while it exists, as gfortran warns about
+    # a missing one; and a FortranToolchain works without a CToolchain
+    @testset "standalone, missing include directory" begin
+        mktempdir() do dir
+            include_dir = joinpath(dir, "prefix", "include")
+            with_toolchains([FortranToolchain(native; extra_fflags=["-I$(include_dir)"]), htt_toolchain]) do prefix, env
+                if !has_gfortran(prefix)
+                    @test_skip has_gfortran(prefix)
+                    return
+                end
+                env = runtime_env(prefix, env)
+                fc = joinpath(prefix, "wrappers", env["FC"])
+                src = joinpath(dir, "hello.f90")
+                cp(joinpath(@__DIR__, "testsuite", "FortranToolchain", "00_hello_world", "hello.f90"), src; follow_symlinks=true)
+                exe = joinpath(dir, "hello")
+                p, output = capture_output(setenv(`$(fc) -Werror -o $(exe) $(src)`, env))
+                @test success(p)
+                @test !occursin("include directory", output)
+                @test readchomp(setenv(`$(exe)`, env)) == "Hello, World!"
+                # Once it exists, it is searched
+                mkpath(include_dir)
+                p, output = capture_output(setenv(`$(fc) -Werror -c -o $(exe).o $(src)`, merge(env, Dict("BB_WRAPPERS_VERBOSE" => "1"))))
+                @test success(p)
+                @test occursin("-I$(include_dir)", output)
+            end
         end
     end
 
