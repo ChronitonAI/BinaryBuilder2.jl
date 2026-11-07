@@ -60,6 +60,7 @@ include("toolchains/CToolchain.jl")
 include("toolchains/CToolchainPlatformExtensions.jl")
 include("toolchains/HostToolsToolchain.jl")
 include("toolchains/CMakeToolchain.jl")
+include("toolchains/FortranToolchain.jl")
 include("PkgUtils.jl")
 include("InteractiveUtils.jl")
 
@@ -77,11 +78,16 @@ include("InteractiveUtils.jl")
             # try/catch when running on platforms other than the typical BB2 host platforms
             # and where we have incomplete toolchain implementations
             try
-                with_toolchains((p, e) -> nothing, [
+                toolchains = AbstractToolchain[
                     CMakeToolchain(platform),
                     CToolchain(platform),
                     HostToolsToolchain(platform)
-                ])
+                ]
+                # Not on macOS, whose C toolchain is clang: it would install a whole GCC
+                if !Sys.isapple(platform.target)
+                    push!(toolchains, FortranToolchain(platform))
+                end
+                with_toolchains((p, e) -> nothing, toolchains)
             catch e
                 @error("Failed to precompile support for platform", platform, exception=(e, catch_backtrace()))
             end

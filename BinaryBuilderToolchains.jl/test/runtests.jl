@@ -17,4 +17,5 @@ with_temp_storage_locations() do
     include("CToolchainTests.jl")
     include("HostToolsToolchainTests.jl")
     include("CMakeToolchainTests.jl")
+    include("FortranToolchainTests.jl")
 end

@@ -1,7 +1,7 @@
 using Base.BinaryPlatforms
 using BinaryBuilderPlatformExtensions
 
-export expand_cxxstring_abis, expand_microarchitectures
+export expand_cxxstring_abis, expand_gfortran_versions, expand_microarchitectures
 
 """
     expand_cxxstring_abis(p::AbstractPlatform; skip=Sys.isbsd, old_abis::Bool=false)
@@ -43,6 +43,34 @@ function expand_cxxstring_abis(platform::AbstractPlatform; skip=Sys.isbsd, old_a
 end
 function expand_cxxstring_abis(ps::Vector{T}; kwargs...) where {T<:AbstractPlatform}
     return collect(T,Iterators.flatten(expand_cxxstring_abis.(ps; kwargs...)))
+end
+
+"""
+    expand_gfortran_versions(p::AbstractPlatform; old_abis::Bool=false)
+
+Given a `Platform`, returns an array of `Platforms` with a spread of identical entries with
+the exception of the `libgfortran_version` tag within the `Platform`, one per `libgfortran`
+ABI that code built for it may link against (see `FortranToolchain`).  Our only GCC is GCC
+14, so that is just `libgfortran5`; asking for the old ABIs (`libgfortran3` and
+`libgfortran4`, of GCC 4.8-6 and 7) with `old_abis` is an error.
+
+If the given `Platform` already specifies a `libgfortran_version` (as opposed to `nothing`),
+only that `Platform` is returned, as it is for an `AnyPlatform` and for a platform with the
+`sanitize=memory` tag (whose code uses flang's runtime rather than `libgfortran`).
+"""
+function expand_gfortran_versions(platform::AbstractPlatform; old_abis::Bool=false)
+    if old_abis
+        throw(ArgumentError("Only libgfortran5 is supported (our GCC is GCC 14): cannot expand to the old libgfortran ABIs"))
+    end
+    if isa(platform, AnyPlatform) || libgfortran_version(platform) !== nothing || sanitize(platform) == "memory"
+        return [platform]
+    end
+    p = deepcopy(platform)
+    p["libgfortran_version"] = "5.0.0"
+    return [p]
+end
+function expand_gfortran_versions(ps::Vector{T}; kwargs...) where {T<:AbstractPlatform}
+    return collect(T, Iterators.flatten(expand_gfortran_versions.(ps; kwargs...)))
 end
 
 """
